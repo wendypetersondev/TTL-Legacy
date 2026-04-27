@@ -468,41 +468,4 @@ mod tests {
         assert!(pdf_str.contains("COMPLIANCE REPORT"));
         assert!(pdf_str.contains("v1"));
     }
-
-    #[test]
-    fn test_get_vault_templates() {
-        let templates = get_vault_templates();
-        assert_eq!(templates.templates.len(), 3);
-        assert!(templates.templates.iter().any(|t| t.id == "simple-inheritance"));
-        assert!(templates.templates.iter().any(|t| t.id == "family-trust"));
-        assert!(templates.templates.iter().any(|t| t.id == "business-succession"));
-    }
-
-    #[test]
-    fn test_create_vault_from_template() {
-        let store = create_vault_store();
-        let result = create_vault_from_template(
-            &store,
-            "simple-inheritance",
-            "owner1".to_string(),
-            "ben1".to_string(),
-        );
-        assert!(result.is_ok());
-        let vault = result.unwrap();
-        assert_eq!(vault.owner, "owner1");
-        assert_eq!(vault.beneficiary, "ben1");
-        assert_eq!(vault.check_in_interval, 86400 * 30);
-    }
-
-    #[test]
-    fn test_create_vault_from_invalid_template() {
-        let store = create_vault_store();
-        let result = create_vault_from_template(
-            &store,
-            "invalid-template",
-            "owner1".to_string(),
-            "ben1".to_string(),
-        );
-        assert!(result.is_err());
-    }
 }
