@@ -79,6 +79,12 @@ pub enum DataKey {
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
+    /// Multi-sig configuration for a vault.
+    MultiSigConfig(u64),
+    /// Pending multi-sig proposal for a vault operation.
+    MultiSigProposal(u64, u64), // (vault_id, proposal_id)
+    /// Monotonic proposal counter per vault.
+    MultiSigProposalCount(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -253,3 +259,64 @@ pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
 }
+
+// ── Multi-sig types ──────────────────────────────────────────────────────────
+
+/// Operations that require multi-sig approval when a vault has multi-sig enabled.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MultiSigOperation {
+    Withdraw,
+    UpdateBeneficiary,
+    CancelVault,
+    TransferOwnership,
+    UpdateCheckInInterval,
+}
+
+/// Multi-sig configuration stored per vault.
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiSigConfig {
+    /// Ordered list of required co-signers (excluding the vault owner).
+    pub signers: Vec<Address>,
+    /// Minimum approvals needed (owner counts as 1; total threshold out of signers.len() + 1).
+    pub threshold: u32,
+}
+
+/// Status of a multi-sig proposal.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Executed,
+    Rejected,
+    Expired,
+}
+
+/// A pending multi-sig proposal for a sensitive vault operation.
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiSigProposal {
+    pub id: u64,
+    pub vault_id: u64,
+    pub operation: MultiSigOperation,
+    /// Numeric payload (amount for Withdraw, interval for UpdateCheckInInterval).
+    pub payload: Bytes,
+    /// Address payload for operations that target an address
+    /// (UpdateBeneficiary → new beneficiary, TransferOwnership → new owner).
+    pub address_payload: Option<Address>,
+    /// Addresses that have approved so far (owner is auto-approved on proposal creation).
+    pub approvals: Vec<Address>,
+    pub status: ProposalStatus,
+    pub created_at: u64,
+    /// Unix timestamp after which the proposal expires (created_at + 7 days).
+    pub expires_at: u64,
+}
+
+pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
+pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
+pub const MULTISIG_APPROVED_TOPIC: Symbol = symbol_short!("ms_appr");
+pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
+pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
+pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");

@@ -3037,3 +3037,305 @@ fn test_cannot_file_duplicate_dispute() {
     let result = client.try_file_dispute(&vault_id, &reason2);
     assert!(result.is_err());
 }
+
+// ── Multi-sig tests ──────────────────────────────────────────────────────────
+
+fn setup_multisig() -> (
+    Env,
+    Address,
+    Address,
+    Address,   // signer1
+    Address,   // signer2
+    TtlVaultContractClient<'static>,
+    u64,       // vault_id
+) {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &86_400u64, &None);
+    (env, owner, beneficiary, signer1, signer2, client, vault_id)
+}
+
+// ── configure_multisig ───────────────────────────────────────────────────────
+
+#[test]
+fn test_configure_multisig_stores_config() {
+    let (env, owner, _, signer1, signer2, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone(), signer2.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let cfg = client.get_multisig_config(&vault_id).expect("config should exist");
+    assert_eq!(cfg.threshold, 2);
+    assert_eq!(cfg.signers.len(), 2);
+    assert!(client.has_multisig(&vault_id));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_configure_multisig_non_owner_rejected() {
+    let (env, _, _, signer1, signer2, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer2.clone()];
+    client.configure_multisig(&vault_id, &signer1, &signers, &1u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #40)")]
+fn test_configure_multisig_threshold_zero_rejected() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #40)")]
+fn test_configure_multisig_threshold_exceeds_total_rejected() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    // total = 2 (owner + 1 signer), threshold = 3 → invalid
+    client.configure_multisig(&vault_id, &owner, &signers, &3u32);
+}
+
+#[test]
+fn test_remove_multisig_clears_config() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &1u32);
+    assert!(client.has_multisig(&vault_id));
+
+    client.remove_multisig(&vault_id, &owner);
+    assert!(!client.has_multisig(&vault_id));
+    assert!(client.get_multisig_config(&vault_id).is_none());
+}
+
+// ── propose_multisig ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_propose_multisig_creates_pending_proposal() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let amount_payload = client.encode_i128_payload(&500i128);
+    let proposal_id = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &amount_payload,
+        &None,
+    );
+    assert_eq!(proposal_id, 1u64);
+    assert_eq!(client.get_multisig_proposal_count(&vault_id), 1u64);
+
+    let prop = client.get_multisig_proposal(&vault_id, &1u64).expect("proposal should exist");
+    assert_eq!(prop.status, types::ProposalStatus::Pending);
+    // Owner auto-approved
+    assert_eq!(prop.approvals.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #34)")]
+fn test_propose_multisig_without_config_rejected() {
+    let (env, owner, _, _, _, client, vault_id) = setup_multisig();
+    let payload = client.encode_i128_payload(&100i128);
+    client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+}
+
+// ── approve_multisig ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_approve_multisig_reaches_threshold() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = client.encode_i128_payload(&100i128);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+
+    // signer1 approves → threshold (2) reached
+    client.approve_multisig(&vault_id, &pid, &signer1);
+
+    let prop = client.get_multisig_proposal(&vault_id, &pid).unwrap();
+    assert_eq!(prop.status, types::ProposalStatus::Approved);
+    assert_eq!(prop.approvals.len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #35)")]
+fn test_approve_multisig_double_approval_rejected() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = client.encode_i128_payload(&100i128);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+    // owner already approved on creation — second approval should fail
+    client.approve_multisig(&vault_id, &pid, &owner);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #39)")]
+fn test_approve_multisig_non_signer_rejected() {
+    let (env, owner, _, signer1, signer2, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = client.encode_i128_payload(&100i128);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+    // signer2 is not in the config
+    client.approve_multisig(&vault_id, &pid, &signer2);
+}
+
+// ── reject_multisig ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_reject_multisig_sets_rejected_status() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = client.encode_i128_payload(&100i128);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+    client.reject_multisig(&vault_id, &pid, &owner);
+
+    let prop = client.get_multisig_proposal(&vault_id, &pid).unwrap();
+    assert_eq!(prop.status, types::ProposalStatus::Rejected);
+}
+
+// ── execute_multisig ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_execute_multisig_withdraw() {
+    let (env, owner, beneficiary, signer1, _, client, vault_id) = setup_multisig();
+    let token_address = client.get_contract_token();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // Fund the vault
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = client.encode_i128_payload(&500i128);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+    client.approve_multisig(&vault_id, &pid, &signer1);
+    client.execute_multisig(&vault_id, &pid, &owner);
+
+    let prop = client.get_multisig_proposal(&vault_id, &pid).unwrap();
+    assert_eq!(prop.status, types::ProposalStatus::Executed);
+    assert_eq!(client.get_vault(&vault_id).balance, 500i128);
+}
+
+#[test]
+fn test_execute_multisig_update_beneficiary() {
+    let (env, owner, beneficiary, signer1, _, client, vault_id) = setup_multisig();
+    let new_beneficiary = Address::generate(&env);
+
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = Bytes::new(&env);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::UpdateBeneficiary,
+        &payload,
+        &Some(new_beneficiary.clone()),
+    );
+    client.approve_multisig(&vault_id, &pid, &signer1);
+    client.execute_multisig(&vault_id, &pid, &owner);
+
+    assert_eq!(client.get_vault(&vault_id).beneficiary, new_beneficiary);
+}
+
+#[test]
+fn test_execute_multisig_cancel_vault() {
+    let (env, owner, beneficiary, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = Bytes::new(&env);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::CancelVault,
+        &payload, &None,
+    );
+    client.approve_multisig(&vault_id, &pid, &signer1);
+    client.execute_multisig(&vault_id, &pid, &owner);
+
+    assert_eq!(client.get_release_status(&vault_id), ReleaseStatus::Cancelled);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #38)")]
+fn test_execute_multisig_not_approved_rejected() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &2u32);
+
+    let payload = client.encode_i128_payload(&100i128);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+    // Only 1 approval (owner), threshold is 2 → still Pending
+    client.execute_multisig(&vault_id, &pid, &owner);
+}
+
+#[test]
+fn test_multisig_threshold_one_owner_only() {
+    // threshold=1 means owner alone can propose+execute immediately
+    let (env, owner, beneficiary, signer1, _, client, vault_id) = setup_multisig();
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &1u32);
+
+    let payload = client.encode_i128_payload(&200i128);
+    let pid = client.propose_multisig(
+        &vault_id, &owner,
+        &types::MultiSigOperation::Withdraw,
+        &payload, &None,
+    );
+    // Owner auto-approved → threshold reached immediately
+    let prop = client.get_multisig_proposal(&vault_id, &pid).unwrap();
+    assert_eq!(prop.status, types::ProposalStatus::Approved);
+
+    client.execute_multisig(&vault_id, &pid, &owner);
+    assert_eq!(client.get_vault(&vault_id).balance, 800i128);
+}
+
+#[test]
+fn test_multisig_proposal_count_increments() {
+    let (env, owner, _, signer1, _, client, vault_id) = setup_multisig();
+    let signers = vec![&env, signer1.clone()];
+    client.configure_multisig(&vault_id, &owner, &signers, &1u32);
+
+    let payload = Bytes::new(&env);
+    client.propose_multisig(&vault_id, &owner, &types::MultiSigOperation::CancelVault, &payload, &None);
+    client.propose_multisig(&vault_id, &owner, &types::MultiSigOperation::CancelVault, &payload, &None);
+
+    assert_eq!(client.get_multisig_proposal_count(&vault_id), 2u64);
+}

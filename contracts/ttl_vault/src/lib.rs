@@ -9,6 +9,7 @@ mod types;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
+    MultiSigConfig, MultiSigOperation, MultiSigProposal, ProposalStatus,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -18,7 +19,8 @@ use types::{
     INHERITANCE_TOPIC, ADD_PASSKEY_TOPIC, REMOVE_PASSKEY_TOPIC, ROTATE_PASSKEY_TOPIC,
     BACKUP_CODE_USED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, DELEGATE_BENEFICIARY_TOPIC,
     DISPUTE_FILED_TOPIC, DISPUTE_RESOLVED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_EXECUTED_TOPIC,
-    CONDITIONS_ACCEPTED_TOPIC,
+    CONDITIONS_ACCEPTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, MULTISIG_PROPOSED_TOPIC,
+    MULTISIG_APPROVED_TOPIC, MULTISIG_EXECUTED_TOPIC, MULTISIG_REJECTED_TOPIC, MULTISIG_CONFIG_TOPIC,
 };
 
 #[cfg(test)]
@@ -97,6 +99,13 @@ pub enum ContractError {
     DisputeFiled = 31,
     NoScheduledWithdrawals = 32,
     ConditionsNotApproved = 33,
+    MultiSigRequired = 34,
+    AlreadyApproved = 35,
+    ProposalNotFound = 36,
+    ProposalExpired = 37,
+    ProposalNotApproved = 38,
+    NotASigner = 39,
+    InvalidThreshold = 40,
 }
 
 #[contract]
@@ -3649,5 +3658,442 @@ impl TtlVaultContract {
             .persistent()
             .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
             .unwrap_or(DisputeStatus::None)
+    }
+
+    // ── Multi-sig ────────────────────────────────────────────────────────────
+
+    /// Configure multi-sig for a vault.
+    ///
+    /// The vault owner sets a list of co-signers and a threshold. Once set,
+    /// sensitive operations (withdraw, update_beneficiary, cancel_vault,
+    /// transfer_ownership, update_check_in_interval) require a multi-sig
+    /// proposal to be created and reach the threshold before execution.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to configure
+    /// * `caller`   - Must be the vault owner
+    /// * `signers`  - Co-signer addresses (must not include the owner)
+    /// * `threshold` - Approvals required (1 ≤ threshold ≤ signers.len() + 1)
+    pub fn configure_multisig(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        // threshold must be at least 1 and at most total signers (owner + co-signers)
+        let total = signers.len() as u32 + 1;
+        if threshold == 0 || threshold > total {
+            return Err(ContractError::InvalidThreshold);
+        }
+        // owner must not appear in the co-signer list
+        for s in signers.iter() {
+            if s == vault.owner {
+                return Err(ContractError::InvalidBeneficiary);
+            }
+        }
+        let config = MultiSigConfig { signers, threshold };
+        let key = DataKey::MultiSigConfig(vault_id);
+        env.storage().persistent().set(&key, &config);
+        env.storage().persistent().extend_ttl(
+            &key, VAULT_TTL_THRESHOLD, vault_ttl_ledgers(vault.check_in_interval),
+        );
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MULTISIG_CONFIG_TOPIC, vault_id), threshold);
+        Ok(())
+    }
+
+    /// Remove multi-sig from a vault (owner-only).
+    pub fn remove_multisig(env: Env, vault_id: u64, caller: Address) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        env.storage().persistent().remove(&DataKey::MultiSigConfig(vault_id));
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Returns the multi-sig config for a vault, if set.
+    pub fn get_multisig_config(env: Env, vault_id: u64) -> Option<MultiSigConfig> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
+    }
+
+    /// Returns true if the vault has multi-sig enabled.
+    pub fn has_multisig(env: Env, vault_id: u64) -> bool {
+        env.storage().persistent().has(&DataKey::MultiSigConfig(vault_id))
+    }
+
+    /// Propose a multi-sig operation.
+    ///
+    /// The vault owner creates a proposal for a sensitive operation. The owner's
+    /// approval is recorded automatically. Co-signers then call `approve_multisig`.
+    /// If threshold == 1 (owner-only), the proposal is immediately executable.
+    ///
+    /// # Arguments
+    /// * `vault_id`        - The vault
+    /// * `caller`          - Must be the vault owner
+    /// * `operation`       - Which operation is being proposed
+    /// * `payload`         - Numeric arguments (i128 LE for Withdraw, u64 LE for UpdateCheckInInterval, empty otherwise)
+    /// * `address_payload` - Address argument for UpdateBeneficiary / TransferOwnership
+    ///
+    /// # Returns
+    /// The new proposal ID.
+    pub fn propose_multisig(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        operation: MultiSigOperation,
+        payload: Bytes,
+        address_payload: Option<Address>,
+    ) -> Result<u64, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        // Vault must have multi-sig configured
+        let config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
+            .ok_or(ContractError::MultiSigRequired)?;
+
+        let count_key = DataKey::MultiSigProposalCount(vault_id);
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0u64)
+            + 1;
+
+        let now = env.ledger().timestamp();
+        // Owner auto-approves on creation
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(caller.clone());
+
+        let proposal = MultiSigProposal {
+            id: proposal_id,
+            vault_id,
+            operation: operation.clone(),
+            payload,
+            address_payload,
+            approvals,
+            status: ProposalStatus::Pending,
+            created_at: now,
+            expires_at: now + MULTISIG_PROPOSAL_EXPIRY,
+        };
+
+        let prop_key = DataKey::MultiSigProposal(vault_id, proposal_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&prop_key, &proposal);
+        env.storage().persistent().extend_ttl(&prop_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().persistent().set(&count_key, &proposal_id);
+        env.storage().persistent().extend_ttl(&count_key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (MULTISIG_PROPOSED_TOPIC, vault_id),
+            (proposal_id, operation, now + MULTISIG_PROPOSAL_EXPIRY),
+        );
+        Ok(proposal_id)
+    }
+
+    /// Approve a pending multi-sig proposal.
+    ///
+    /// Only configured co-signers (or the owner) may approve. Each address
+    /// may approve at most once. When the approval count reaches the threshold
+    /// the proposal status is set to `Approved` and is ready for execution.
+    pub fn approve_multisig(
+        env: Env,
+        vault_id: u64,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
+            .ok_or(ContractError::MultiSigRequired)?;
+
+        let vault = Self::load_vault(&env, vault_id);
+
+        // Caller must be owner or a configured co-signer
+        let is_owner = caller == vault.owner;
+        let is_signer = config.signers.iter().any(|s| s == caller);
+        if !is_owner && !is_signer {
+            return Err(ContractError::NotASigner);
+        }
+
+        let prop_key = DataKey::MultiSigProposal(vault_id, proposal_id);
+        let mut proposal = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigProposal>(&prop_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Pending {
+            return Err(ContractError::ProposalNotFound);
+        }
+        let now = env.ledger().timestamp();
+        if now > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            env.storage().persistent().set(&prop_key, &proposal);
+            return Err(ContractError::ProposalExpired);
+        }
+        // Prevent double-approval
+        if proposal.approvals.iter().any(|a| a == caller) {
+            return Err(ContractError::AlreadyApproved);
+        }
+
+        proposal.approvals.push_back(caller.clone());
+
+        if proposal.approvals.len() as u32 >= config.threshold {
+            proposal.status = ProposalStatus::Approved;
+        }
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&prop_key, &proposal);
+        env.storage().persistent().extend_ttl(&prop_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (MULTISIG_APPROVED_TOPIC, vault_id),
+            (proposal_id, caller, proposal.approvals.len() as u32),
+        );
+        Ok(())
+    }
+
+    /// Reject a pending multi-sig proposal (owner-only).
+    pub fn reject_multisig(
+        env: Env,
+        vault_id: u64,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let prop_key = DataKey::MultiSigProposal(vault_id, proposal_id);
+        let mut proposal = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigProposal>(&prop_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+        if proposal.status != ProposalStatus::Pending {
+            return Err(ContractError::ProposalNotFound);
+        }
+        proposal.status = ProposalStatus::Rejected;
+        env.storage().persistent().set(&prop_key, &proposal);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MULTISIG_REJECTED_TOPIC, vault_id), proposal_id);
+        Ok(())
+    }
+
+    /// Execute an approved multi-sig proposal.
+    ///
+    /// The proposal must be in `Approved` status. The owner calls this to
+    /// actually perform the operation. The payload is interpreted according
+    /// to the operation type.
+    ///
+    /// Supported operations and their payload encoding:
+    /// - `Withdraw`: 16-byte little-endian i128 amount
+    /// - `UpdateBeneficiary`: 32-byte Stellar address (raw bytes)
+    /// - `CancelVault`: empty payload
+    /// - `TransferOwnership`: 32-byte new owner address (raw bytes)
+    /// - `UpdateCheckInInterval`: 8-byte little-endian u64 interval
+    pub fn execute_multisig(
+        env: Env,
+        vault_id: u64,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let prop_key = DataKey::MultiSigProposal(vault_id, proposal_id);
+        let mut proposal = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigProposal>(&prop_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        if proposal.status != ProposalStatus::Approved {
+            return Err(ContractError::ProposalNotApproved);
+        }
+        let now = env.ledger().timestamp();
+        if now > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            env.storage().persistent().set(&prop_key, &proposal);
+            return Err(ContractError::ProposalExpired);
+        }
+
+        // Mark executed before performing the operation (re-entrancy guard)
+        proposal.status = ProposalStatus::Executed;
+        env.storage().persistent().set(&prop_key, &proposal);
+
+        match proposal.operation {
+            MultiSigOperation::Withdraw => {
+                // payload: 16-byte LE i128
+                let amount = Self::decode_i128(&proposal.payload)?;
+                Self::do_withdraw(&env, vault_id, &vault, amount)?;
+            }
+            MultiSigOperation::UpdateBeneficiary => {
+                let new_beneficiary = proposal.address_payload
+                    .ok_or(ContractError::InvalidAmount)?;
+                if new_beneficiary == vault.owner {
+                    return Err(ContractError::InvalidBeneficiary);
+                }
+                let mut v = vault.clone();
+                let old = v.beneficiary.clone();
+                v.beneficiary = new_beneficiary.clone();
+                Self::save_vault(&env, vault_id, &v);
+                if old != new_beneficiary {
+                    Self::remove_beneficiary_vault_id(&env, &old, vault_id, v.check_in_interval);
+                    Self::add_beneficiary_vault_id(&env, &new_beneficiary, vault_id, v.check_in_interval);
+                }
+                env.events().publish((BENEFICIARY_UPDATED_TOPIC, vault_id), (old, new_beneficiary));
+            }
+            MultiSigOperation::CancelVault => {
+                let mut v = vault.clone();
+                let refund = v.balance;
+                if refund > 0 {
+                    let token_client = token::Client::new(&env, &v.token_address);
+                    token_client.transfer(&env.current_contract_address(), &v.owner, &refund);
+                }
+                v.balance = 0;
+                v.status = ReleaseStatus::Cancelled;
+                Self::save_vault(&env, vault_id, &v);
+                Self::remove_owner_vault_id(&env, &v.owner, vault_id, v.check_in_interval);
+                Self::remove_beneficiary_vault_id(&env, &v.beneficiary, vault_id, v.check_in_interval);
+                env.events().publish((CANCEL_TOPIC, vault_id), (v.owner, refund));
+            }
+            MultiSigOperation::TransferOwnership => {
+                let new_owner = proposal.address_payload
+                    .ok_or(ContractError::InvalidAmount)?;
+                if new_owner == vault.beneficiary {
+                    return Err(ContractError::InvalidBeneficiary);
+                }
+                let old_owner = vault.owner.clone();
+                if old_owner != new_owner {
+                    Self::remove_owner_vault_id(&env, &old_owner, vault_id, vault.check_in_interval);
+                    Self::add_owner_vault_id(&env, &new_owner, vault_id, vault.check_in_interval);
+                }
+                let mut v = vault.clone();
+                v.owner = new_owner.clone();
+                Self::save_vault(&env, vault_id, &v);
+                env.events().publish((OWNERSHIP_TOPIC, vault_id), (old_owner, new_owner));
+            }
+            MultiSigOperation::UpdateCheckInInterval => {
+                let new_interval = Self::decode_u64(&proposal.payload)?;
+                if new_interval == 0 {
+                    return Err(ContractError::InvalidInterval);
+                }
+                Self::assert_interval_in_bounds(&env, new_interval);
+                let mut v = vault.clone();
+                let old = v.check_in_interval;
+                v.check_in_interval = new_interval;
+                v.last_check_in = now;
+                Self::save_vault(&env, vault_id, &v);
+                let new_ttl = vault_ttl_ledgers(new_interval);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::Vault(vault_id), VAULT_TTL_THRESHOLD, new_ttl,
+                );
+                env.events().publish((UPDATE_INTERVAL_TOPIC, vault_id), (old, new_interval));
+            }
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MULTISIG_EXECUTED_TOPIC, vault_id), proposal_id);
+        Ok(())
+    }
+
+    /// Returns a proposal by ID.
+    pub fn get_multisig_proposal(env: Env, vault_id: u64, proposal_id: u64) -> Option<MultiSigProposal> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, MultiSigProposal>(&DataKey::MultiSigProposal(vault_id, proposal_id))
+    }
+
+    /// Returns the current proposal count for a vault.
+    pub fn get_multisig_proposal_count(env: Env, vault_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultiSigProposalCount(vault_id))
+            .unwrap_or(0)
+    }
+
+    // ── Multi-sig payload helpers ────────────────────────────────────────────
+
+    fn decode_i128(payload: &Bytes) -> Result<i128, ContractError> {
+        if payload.len() < 16 {
+            return Err(ContractError::InvalidAmount);
+        }
+        let mut buf = [0u8; 16];
+        for i in 0..16usize {
+            buf[i] = payload.get(i as u32).unwrap_or(0);
+        }
+        Ok(i128::from_le_bytes(buf))
+    }
+
+    fn decode_u64(payload: &Bytes) -> Result<u64, ContractError> {
+        if payload.len() < 8 {
+            return Err(ContractError::InvalidAmount);
+        }
+        let mut buf = [0u8; 8];
+        for i in 0..8usize {
+            buf[i] = payload.get(i as u32).unwrap_or(0);
+        }
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    /// Encode an i128 as 16-byte LE for use as a multi-sig payload.
+    pub fn encode_i128_payload(env: Env, value: i128) -> Bytes {
+        let raw = value.to_le_bytes();
+        Bytes::from_array(&env, &raw)
+    }
+
+    /// Encode a u64 as 8-byte LE for use as a multi-sig payload.
+    pub fn encode_u64_payload(env: Env, value: u64) -> Bytes {
+        let raw = value.to_le_bytes();
+        Bytes::from_array(&env, &raw)
+    }
+
+    // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
+
+    fn do_withdraw(env: &Env, vault_id: u64, vault: &Vault, amount: i128) -> Result<(), ContractError> {
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        if vault.balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+        let token_client = token::Client::new(env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &vault.owner, &amount);
+        let mut v = vault.clone();
+        v.balance -= amount;
+        Self::save_vault(env, vault_id, &v);
+        env.events().publish((WITHDRAW_TOPIC, vault_id), (amount, v.balance));
+        Ok(())
     }
 }
