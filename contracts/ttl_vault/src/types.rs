@@ -37,6 +37,26 @@ pub const WITHDRAWAL_SCHEDULED_TOPIC: Symbol = symbol_short!("wd_sch");
 pub const WITHDRAWAL_EXECUTED_TOPIC: Symbol = symbol_short!("wd_exec");
 pub const CONDITIONS_ACCEPTED_TOPIC: Symbol = symbol_short!("cond_acc");
 pub const SET_SPENDING_LIMIT_TOPIC: Symbol = symbol_short!("set_slmt");
+pub const SET_MAX_TTL_TOPIC: Symbol = symbol_short!("set_ttl");
+pub const SET_DECAY_RATE_TOPIC: Symbol = symbol_short!("set_dec");
+pub const ACCEPTANCE_DEADLINE_EXPIRED_TOPIC: Symbol = symbol_short!("acc_exp");
+pub const TTL_DECAY_TOPIC: Symbol = symbol_short!("ttl_dec");
+pub const SYNC_TTL_TOPIC: Symbol = symbol_short!("sync_ttl");
+pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
+pub const BENEFICIARY_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_acc");
+pub const BENEFICIARY_DECLINED_TOPIC: Symbol = symbol_short!("ben_dec");
+pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
+pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
+pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
+pub const PASSKEY_USAGE_TOPIC: Symbol = symbol_short!("pk_usage");
+pub const VAULT_CLONED_TOPIC: Symbol = symbol_short!("v_clone");
+pub const VAULT_MERGED_TOPIC: Symbol = symbol_short!("v_merge");
+pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");
+pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
+pub const MULTISIG_APPROVED_TOPIC: Symbol = symbol_short!("ms_app");
+pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
+pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
+pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -84,6 +104,17 @@ pub enum DataKey {
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
     ArchivedVault(u64),
+    MaxTtlSeconds,
+    TtlDecayRate,
+    BridgeConfig(u32),
+    PasskeyUsage(u64),
+    BeneficiaryStatus(u64),
+    PasskeyExpiry(u64, BytesN<32>),
+    PendingOwnership(u64),
+    VaultAuditLog(u64),
+    MultiSigConfig(u64),
+    MultiSigProposal(u64, u64),
+    MultiSigProposalCount(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -276,3 +307,70 @@ pub struct ActivityLogEntry {
 #[contracttype]
 #[derive(Clone)]
 pub struct ArchivedVaultInfo(pub Vault);
+
+/// Ownership transfer request
+#[contracttype]
+#[derive(Clone)]
+pub struct OwnershipTransferRequest {
+    pub new_owner: Address,
+    pub initiated_at: u64,
+    pub unlocks_at: u64,
+    pub expires_at: u64,
+}
+
+/// Audit entry for vault operations
+#[contracttype]
+#[derive(Clone)]
+pub struct AuditEntry {
+    pub action: String,
+    pub caller: Address,
+    pub timestamp: u64,
+    pub operation: String,
+    pub actor: Address,
+    pub details: String,
+}
+
+/// Multi-signature configuration
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiSigConfig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+/// Multi-signature proposal
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiSigProposal {
+    pub id: u64,
+    pub operation: MultiSigOperation,
+    pub approvals: Vec<Address>,
+    pub status: ProposalStatus,
+    pub expires_at: u64,
+    pub vault_id: u64,
+    pub payload: Bytes,
+    pub address_payload: Option<Address>,
+    pub created_at: u64,
+}
+
+/// Multi-signature operation types
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MultiSigOperation {
+    Withdraw,
+    UpdateBeneficiary,
+    CancelVault,
+    UpdateCheckInInterval,
+    TransferOwnership,
+}
+
+/// Proposal status
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Executed,
+    Expired,
+}

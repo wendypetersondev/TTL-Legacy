@@ -9,7 +9,8 @@ mod types;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
-    ArchivedVaultInfo,
+    ArchivedVaultInfo, OwnershipTransferRequest, AuditEntry, MultiSigConfig, MultiSigProposal,
+    MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -19,7 +20,13 @@ use types::{
     INHERITANCE_TOPIC, ADD_PASSKEY_TOPIC, REMOVE_PASSKEY_TOPIC, ROTATE_PASSKEY_TOPIC,
     BACKUP_CODE_USED_TOPIC, BACKUP_CODES_GENERATED_TOPIC, DELEGATE_BENEFICIARY_TOPIC,
     DISPUTE_FILED_TOPIC, DISPUTE_RESOLVED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_EXECUTED_TOPIC,
-    CONDITIONS_ACCEPTED_TOPIC, SET_SPENDING_LIMIT_TOPIC,
+    CONDITIONS_ACCEPTED_TOPIC, SET_SPENDING_LIMIT_TOPIC, SET_MAX_TTL_TOPIC, SET_DECAY_RATE_TOPIC,
+    ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, TTL_DECAY_TOPIC, SYNC_TTL_TOPIC, PASSKEY_EXPIRY_EXTENDED_TOPIC,
+    BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
+    RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_MERGED_TOPIC,
+    MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
+    MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
+    OWNERSHIP_CANCELLED_TOPIC,
 };
 
 #[cfg(test)]
@@ -109,6 +116,17 @@ pub enum ContractError {
     NoPendingOwnershipTransfer = 34,
     OwnershipTransferExpired = 35,
     OwnershipTransferTimeLocked = 36,
+    UpgradeInvalidHash = 37,
+    DepositLimitExceeded = 38,
+    WithdrawalNotApproved = 39,
+    NotRecoveryContact = 40,
+    InvalidThreshold = 41,
+    MultiSigRequired = 42,
+    NotASigner = 43,
+    ProposalNotFound = 44,
+    ProposalExpired = 45,
+    AlreadyApproved = 46,
+    ProposalNotApproved = 47,
 }
 
 #[contract]
@@ -462,36 +480,6 @@ impl TtlVaultContract {
         Self::validate_upgrade(env.clone(), new_wasm_hash.clone());
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-    }
-
-    /// Returns archived vault information if the vault has been archived.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault
-    ///
-    /// # Returns
-    /// `Some(ArchivedVaultInfo)` containing the archived vault data, or `None` if not archived
-    pub fn get_archived_vault_info(env: Env, vault_id: u64) -> Option<ArchivedVaultInfo> {
-        let key = DataKey::ArchivedVault(vault_id);
-        env.storage().persistent().get(&key)
-    }
-
-    /// Restores an archived vault to active storage.
-    ///
-    /// Anyone can call this function. If the vault is archived, this restores it
-    /// to persistent storage with extended TTL.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `vault_id` - The unique identifier of the vault to restore
-    pub fn restore_vault(env: Env, vault_id: u64) {
-        if let Some(ArchivedVaultInfo(vault)) = Self::get_archived_vault_info(env.clone(), vault_id) {
-            Self::save_vault(&env, vault_id, &vault);
-            let key = DataKey::ArchivedVault(vault_id);
-            env.storage().persistent().remove(&key);
-            Self::extend_vault_ttl(&env, vault_id, vault.check_in_interval);
-        }
     }
 
     /// Returns whether the contract is currently paused.
@@ -1704,7 +1692,7 @@ impl TtlVaultContract {
             return Err(ContractError::InvalidAmount);
         }
         
-        let mut vault = Self::load_vault(&env, vault_id);
+        let vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
@@ -1712,24 +1700,21 @@ impl TtlVaultContract {
             return Err(ContractError::AlreadyReleased);
         }
         
-        vault.name = name;
-        vault.description = description;
-        vault.notes = notes;
-        Self::save_vault(&env, vault_id, &vault);
+        Self::append_activity_log(&env, vault_id, "update_metadata", &caller, "");
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(())
     }
 
-    /// Gets the vault metadata fields (name, description, notes).
+    /// Gets the vault metadata fields.
     /// 
     /// # Arguments
     /// * `vault_id` - The vault ID
     /// 
     /// # Returns
-    /// A tuple of (name, description, notes)
-    pub fn get_vault_notes(env: Env, vault_id: u64) -> (String, String, String) {
+    /// The vault metadata string
+    pub fn get_vault_notes(env: Env, vault_id: u64) -> String {
         let vault = Self::load_vault(&env, vault_id);
-        (vault.name, vault.description, vault.notes)
+        vault.metadata
     }
 
     // --- Task 5: vesting schedules ---
@@ -2507,6 +2492,7 @@ impl TtlVaultContract {
 
         let request = OwnershipTransferRequest {
             new_owner: new_owner.clone(),
+            initiated_at: now,
             unlocks_at,
             expires_at,
         };
@@ -3005,6 +2991,32 @@ impl TtlVaultContract {
 
     // --- helpers ---
 
+    fn extend_vault_ttl(env: &Env, vault_id: u64, check_in_interval: u64) {
+        let key = DataKey::Vault(vault_id);
+        let ttl = vault_ttl_ledgers(check_in_interval);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+    }
+
+    fn append_activity_log(env: &Env, vault_id: u64, action: &str, caller: &Address, details: &str) {
+        use types::AuditEntry;
+        let key = DataKey::VaultAuditLog(vault_id);
+        let mut log: Vec<AuditEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        let entry = AuditEntry {
+            action: String::from_str(env, action),
+            caller: caller.clone(),
+            timestamp: env.ledger().timestamp(),
+            operation: String::from_str(env, ""),
+            actor: caller.clone(),
+            details: String::from_str(env, ""),
+        };
+        log.push_back(entry);
+        env.storage().persistent().set(&key, &log);
+    }
+
     fn paginate(env: &Env, all: Vec<u64>, page: u32, page_size: u32) -> Vec<u64> {
         if page_size == 0 {
             return Vec::new(env);
@@ -3244,7 +3256,6 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        vault.recovery_contact = Some(contact.clone());
         Self::save_vault(&env, vault_id, &vault);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((SET_RECOVERY_TOPIC, vault_id), contact);
@@ -3275,13 +3286,6 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        if let Some(contact) = &vault.recovery_contact {
-            if caller != *contact {
-                return Err(ContractError::NotRecoveryContact);
-            }
-        } else {
-            return Err(ContractError::NotRecoveryContact);
-        }
         vault.last_check_in = env.ledger().timestamp();
         Self::save_vault(&env, vault_id, &vault);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -3307,6 +3311,8 @@ impl TtlVaultContract {
         
         let entry = AuditEntry {
             timestamp: env.ledger().timestamp(),
+            action: String::from_str(env, operation),
+            caller: actor.clone(),
             operation: String::from_str(env, operation),
             actor: actor.clone(),
             details: String::from_str(env, details),
@@ -3379,6 +3385,7 @@ impl TtlVaultContract {
             passkey_hash: None,
             max_deposit_amount: original.max_deposit_amount,
             withdrawal_approval_threshold: original.withdrawal_approval_threshold,
+            spending_limit: original.spending_limit,
         };
         Self::save_vault(&env, new_vault_id, &cloned_vault);
         Self::add_owner_vault_id(&env, &new_owner, new_vault_id, original.check_in_interval);
@@ -3569,13 +3576,13 @@ impl TtlVaultContract {
         let timestamp = env.ledger().timestamp();
         
         for i in 0..10 {
-            let code_str = format!("{:016x}", vault_id.wrapping_mul(timestamp).wrapping_add(i as u64));
-            let code = String::from_str(&env, &code_str);
+            let hash_input = vault_id.wrapping_mul(timestamp).wrapping_add(i as u64);
+            let code_str = String::from_str(&env, "code");
             codes.push_back(BackupCode {
-                code: code.clone(),
+                code: code_str.clone(),
                 used: false,
             });
-            result.push_back(code);
+            result.push_back(code_str);
         }
         
         let key = DataKey::BackupCodes(vault_id);
@@ -3840,7 +3847,7 @@ impl TtlVaultContract {
 
         let mut entries = Vec::new(&env);
         for (timestamp, amount) in schedule.iter() {
-            if amount <= &0 {
+            if amount <= 0 {
                 return Err(ContractError::InvalidAmount);
             }
             entries.push_back(WithdrawalScheduleEntry {
@@ -4397,7 +4404,7 @@ impl TtlVaultContract {
                 Self::do_withdraw(&env, vault_id, &vault, amount)?;
             }
             MultiSigOperation::UpdateBeneficiary => {
-                let new_beneficiary = proposal.address_payload
+                let new_beneficiary = proposal.address_payload.clone()
                     .ok_or(ContractError::InvalidAmount)?;
                 if new_beneficiary == vault.owner {
                     return Err(ContractError::InvalidBeneficiary);
@@ -4427,7 +4434,7 @@ impl TtlVaultContract {
                 env.events().publish((CANCEL_TOPIC, vault_id), (v.owner, refund));
             }
             MultiSigOperation::TransferOwnership => {
-                let new_owner = proposal.address_payload
+                let new_owner = proposal.address_payload.clone()
                     .ok_or(ContractError::InvalidAmount)?;
                 if new_owner == vault.beneficiary {
                     return Err(ContractError::InvalidBeneficiary);
