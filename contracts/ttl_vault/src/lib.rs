@@ -40,6 +40,7 @@ use types::{
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
     EMERGENCY_FREEZE_TOPIC, FREEZE_RESOLVED_TOPIC,
     BeneficiaryRotationEntry, BEN_ROTATION_TOPIC,
+    INACTIVITY_PENALTY_TOPIC,
 };
 
 #[cfg(test)]
@@ -650,6 +651,8 @@ impl TtlVaultContract {
                 max_deposit_amount: None,
                 withdrawal_approval_threshold: None,
                 spending_limit: None,
+                inactivity_penalty_bps: None,
+                penalty_recipient: None,
             };
             Self::save_vault(&env, vault_id, &vault);
             Self::add_owner_vault_id(&env, &owner, vault_id, check_in_interval);
@@ -746,6 +749,22 @@ impl TtlVaultContract {
         
         vault.last_check_in = now;
         
+        // Inactivity penalty: deduct per missed check-in interval
+        if let (Some(penalty_bps), Some(recipient)) = (vault.inactivity_penalty_bps, vault.penalty_recipient.clone()) {
+            let elapsed = now.saturating_sub(original_last_check_in);
+            let missed = (elapsed / vault.check_in_interval).saturating_sub(1);
+            if missed > 0 && vault.balance > 0 {
+                let penalty_per = vault.balance * (penalty_bps as i128) / 10_000;
+                let total_penalty = (penalty_per * missed as i128).min(vault.balance);
+                if total_penalty > 0 {
+                    let token_client = token::Client::new(&env, &vault.token_address);
+                    token_client.transfer(&env.current_contract_address(), &recipient, &total_penalty);
+                    vault.balance -= total_penalty;
+                    env.events().publish((INACTIVITY_PENALTY_TOPIC, vault_id), (total_penalty, recipient));
+                }
+            }
+        }
+
         // Cap TTL at max_ttl_seconds
         let max_ttl = Self::get_max_ttl_seconds(env.clone());
         let deadline = now + vault.check_in_interval;
@@ -3077,6 +3096,8 @@ impl TtlVaultContract {
             max_deposit_amount: None,
             withdrawal_approval_threshold: None,
             spending_limit: None,
+            inactivity_penalty_bps: None,
+            penalty_recipient: None,
         };
         
         Self::save_vault(&env, vault_id, &new_vault);
@@ -5880,6 +5901,51 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    // ── Inactivity Penalty ───────────────────────────────────────────────────
+
+    /// Configures an inactivity penalty for a vault.
+    ///
+    /// When the owner checks in after missing one or more full intervals, a penalty
+    /// of `penalty_bps` basis points of the current balance is deducted per missed
+    /// interval and transferred to `recipient`.
+    ///
+    /// # Arguments
+    /// * `vault_id`    - The vault to configure
+    /// * `caller`      - Must be the vault owner (requires auth)
+    /// * `penalty_bps` - Penalty per missed interval in basis points (0 = disable)
+    /// * `recipient`   - Address that receives the penalty
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`      - If caller is not the vault owner
+    /// * `ContractError::InvalidAmount` - If penalty_bps > 10_000
+    pub fn set_inactivity_penalty(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        penalty_bps: u32,
+        recipient: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if penalty_bps > 10_000 {
+            return Err(ContractError::InvalidAmount);
+        }
+        if penalty_bps == 0 {
+            vault.inactivity_penalty_bps = None;
+            vault.penalty_recipient = None;
+        } else {
+            vault.inactivity_penalty_bps = Some(penalty_bps);
+            vault.penalty_recipient = Some(recipient.clone());
+        }
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((INACTIVITY_PENALTY_TOPIC, vault_id), (penalty_bps, recipient));
+        Ok(())
     }
 
     // ── Beneficiary Rotation Schedule ────────────────────────────────────────
