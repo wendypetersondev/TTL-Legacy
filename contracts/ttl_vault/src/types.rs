@@ -84,6 +84,9 @@ pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
 // Issue #499: beneficiary voting
 pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
 pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
+// Hibernation events
+pub const HIBERNATION_ENTERED_TOPIC: Symbol = symbol_short!("hib_ent");
+pub const HIBERNATION_EXITED_TOPIC: Symbol = symbol_short!("hib_ext");
 
 // Previously missing — used by lib.rs internal helpers
 pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
@@ -180,6 +183,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // Hibernation: temporary suspension of check-in requirement
+    Hibernation(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -536,4 +541,16 @@ pub struct TtlPool {
 pub struct BiometricEntry {
     pub credential_hash: BytesN<32>,
     pub added_at: u64,
+}
+
+/// Hibernation entry — records when a vault entered hibernation and for how long.
+/// While hibernating, the vault's expiry deadline is extended by `duration_seconds`,
+/// so no check-ins are required during that period.
+#[contracttype]
+#[derive(Clone)]
+pub struct HibernationEntry {
+    /// Ledger timestamp when hibernation started.
+    pub started_at: u64,
+    /// How many seconds the hibernation lasts.
+    pub duration_seconds: u64,
 }

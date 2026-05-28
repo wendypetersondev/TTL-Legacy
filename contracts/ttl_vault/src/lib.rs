@@ -38,6 +38,8 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
+    HibernationEntry,
+    HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC,
 };
 
 #[cfg(test)]
@@ -148,6 +150,8 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
+    AlreadyHibernating = 55,
+    NotHibernating = 56,
 }
 
 #[contract]
@@ -2023,7 +2027,20 @@ impl TtlVaultContract {
     pub fn is_expired(env: Env, vault_id: u64) -> bool {
         let vault = Self::load_vault(&env, vault_id);
         let now = env.ledger().timestamp();
-        now >= vault.last_check_in + vault.check_in_interval
+        // Compute how many seconds of hibernation have elapsed (capped at duration).
+        let hibernated = if let Some(h) = env.storage().persistent()
+            .get::<DataKey, HibernationEntry>(&DataKey::Hibernation(vault_id))
+        {
+            let elapsed = now.saturating_sub(h.started_at).min(h.duration_seconds);
+            // If still inside the hibernation window, vault cannot expire.
+            if elapsed < h.duration_seconds {
+                return false;
+            }
+            h.duration_seconds
+        } else {
+            0u64
+        };
+        now >= vault.last_check_in + vault.check_in_interval + hibernated
     }
 
     /// Retrieves a vault by its unique identifier.
@@ -5837,5 +5854,109 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    // ── Hibernation ──────────────────────────────────────────────────────────
+
+    /// Puts a vault into hibernation for `duration_seconds`.
+    ///
+    /// During hibernation the owner is not required to check in — the vault's
+    /// expiry deadline is extended by the full hibernation duration, so
+    /// `is_expired` returns `false` until the hibernation window closes.
+    /// Normal operations (deposit, withdraw, check_in) remain available.
+    ///
+    /// # Arguments
+    /// * `vault_id`         - The vault to hibernate
+    /// * `caller`           - Must be the vault owner
+    /// * `duration_seconds` - How long (in seconds) the hibernation lasts (> 0)
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`          - Caller is not the vault owner
+    /// * `ContractError::AlreadyReleased`   - Vault is not Locked
+    /// * `ContractError::AlreadyHibernating`- Vault is already hibernating
+    /// * `ContractError::InvalidInterval`   - `duration_seconds` is zero
+    pub fn enter_hibernation(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        duration_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        if duration_seconds == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let hib_key = DataKey::Hibernation(vault_id);
+        if env.storage().persistent().has(&hib_key) {
+            return Err(ContractError::AlreadyHibernating);
+        }
+        let now = env.ledger().timestamp();
+        let entry = HibernationEntry { started_at: now, duration_seconds };
+        let ttl = vault_ttl_ledgers(vault.check_in_interval + duration_seconds);
+        env.storage().persistent().set(&hib_key, &entry);
+        env.storage().persistent().extend_ttl(&hib_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (HIBERNATION_ENTERED_TOPIC, vault_id),
+            (caller, now, duration_seconds),
+        );
+        Ok(())
+    }
+
+    /// Exits hibernation early, resuming normal check-in requirements.
+    ///
+    /// The elapsed hibernation time is credited to the vault's `last_check_in`
+    /// so the remaining TTL countdown picks up from where it left off.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to wake from hibernation
+    /// * `caller`   - Must be the vault owner
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`        - Caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - Vault is not Locked
+    /// * `ContractError::NotHibernating`  - Vault is not currently hibernating
+    pub fn exit_hibernation(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let hib_key = DataKey::Hibernation(vault_id);
+        let entry = env.storage().persistent()
+            .get::<DataKey, HibernationEntry>(&hib_key)
+            .ok_or(ContractError::NotHibernating)?;
+        let now = env.ledger().timestamp();
+        // Credit elapsed hibernation time so the TTL countdown resumes correctly.
+        let elapsed = now.saturating_sub(entry.started_at).min(entry.duration_seconds);
+        vault.last_check_in = vault.last_check_in.saturating_add(elapsed);
+        env.storage().persistent().remove(&hib_key);
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (HIBERNATION_EXITED_TOPIC, vault_id),
+            (caller, now, elapsed),
+        );
+        Ok(())
+    }
+
+    /// Returns the current hibernation entry for a vault, if it is hibernating.
+    pub fn get_hibernation(env: Env, vault_id: u64) -> Option<HibernationEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Hibernation(vault_id))
     }
 }
