@@ -21,6 +21,8 @@ pub const PAUSE_TOPIC: Symbol = symbol_short!("pause");
 pub const UNPAUSE_TOPIC: Symbol = symbol_short!("unpause");
 pub const SET_VESTING_TOPIC: Symbol = symbol_short!("set_vest");
 pub const CLAIM_VEST_TOPIC: Symbol = symbol_short!("clm_vest");
+// Issue #534: vesting cliff period reached
+pub const CLIFF_REACHED_TOPIC: Symbol = symbol_short!("clif_rch");
 pub const PAUSE_VAULT_TOPIC: Symbol = symbol_short!("v_pause");
 pub const RESUME_VAULT_TOPIC: Symbol = symbol_short!("v_resume");
 pub const SET_METADATA_TOPIC: Symbol = symbol_short!("set_meta");
@@ -45,11 +47,15 @@ pub const SYNC_TTL_TOPIC: Symbol = symbol_short!("sync_ttl");
 pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
 pub const BENEFICIARY_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_acc");
 pub const BENEFICIARY_DECLINED_TOPIC: Symbol = symbol_short!("ben_dec");
+pub const BENEFICIARY_CONDITION_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_cond");
+pub const BENEFICIARY_CONFLICT_FILED_TOPIC: Symbol = symbol_short!("ben_conf");
+pub const BENEFICIARY_CONFLICT_RESOLVED_TOPIC: Symbol = symbol_short!("ben_res");
 pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
 pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
 pub const PASSKEY_USAGE_TOPIC: Symbol = symbol_short!("pk_usage");
 pub const VAULT_CLONED_TOPIC: Symbol = symbol_short!("v_clone");
+pub const VAULT_CLONED_OVERRIDE_TOPIC: Symbol = symbol_short!("v_clo_ov");
 pub const VAULT_MERGED_TOPIC: Symbol = symbol_short!("v_merge");
 pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");
 pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
@@ -84,6 +90,9 @@ pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
 // Issue #499: beneficiary voting
 pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
 pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
+// Hibernation events
+pub const HIBERNATION_ENTERED_TOPIC: Symbol = symbol_short!("hib_ent");
+pub const HIBERNATION_EXITED_TOPIC: Symbol = symbol_short!("hib_ext");
 
 // Issue #547: vesting penalty applied
 pub const VESTING_PENALTY_TOPIC: Symbol = symbol_short!("vest_pen");
@@ -99,14 +108,52 @@ pub const PASSKEY_COMPROMISED_TOPIC: Symbol = symbol_short!("pk_comp");
 pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
 pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 
+// Vault state snapshots
+pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
+pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
+
+// Configurable countdown notifications
+pub const COUNTDOWN_NOTIF_TOPIC: Symbol = symbol_short!("cd_notif");
+pub const SET_COUNTDOWN_TOPIC: Symbol = symbol_short!("set_cd");
+
 // Issue: Check-in Rate Limiting
 pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
+
+// Beneficiary capacity limit
+pub const BENEFICIARY_CAP_TOPIC: Symbol = symbol_short!("ben_cap");
 
 // Issue: Accelerated TTL Decay
 pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 
+// Emergency freeze events
+pub const EMERGENCY_FREEZE_TOPIC: Symbol = symbol_short!("emg_frz");
+pub const FREEZE_RESOLVED_TOPIC: Symbol = symbol_short!("frz_res");
+
+// Beneficiary rotation
+pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
+
+// Inactivity penalty
+pub const INACTIVITY_PENALTY_TOPIC: Symbol = symbol_short!("inact_pen");
+
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
+
+// Issue #494: Beneficiary Succession Planning
+pub const SUCCESSION_SET_TOPIC: Symbol = symbol_short!("suc_set");
+pub const SUCCESSION_ACTIVATED_TOPIC: Symbol = symbol_short!("suc_act");
+
+// Issue #495: Beneficiary Escrow
+pub const ESCROW_CREATED_TOPIC: Symbol = symbol_short!("esc_cre");
+pub const ESCROW_ACCEPTED_TOPIC: Symbol = symbol_short!("esc_acc");
+pub const ESCROW_REJECTED_TOPIC: Symbol = symbol_short!("esc_rej");
+pub const ESCROW_EXPIRED_TOPIC: Symbol = symbol_short!("esc_exp");
+
+// Issue #496: Dispute Arbitration
+pub const ARBITRATOR_SET_TOPIC: Symbol = symbol_short!("arb_set");
+pub const ARBITRATION_RULED_TOPIC: Symbol = symbol_short!("arb_rul");
+
+// Issue #497: Beneficiary Notification
+pub const VAULT_NOTIFY_TOPIC: Symbol = symbol_short!("v_notif");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -184,19 +231,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
-    // TTL Borrowing
-    TtlBorrow(u64),
-    // Check-in rate limiting
-    MinCheckInCooldown,
-    LastCheckInTime(u64),
-    // Geographic check-in tracking
-    CheckInGeoLog(u64),
-    // Issue #547: vesting penalty config per vault
-    VestingPenalty(u64),
-    // Issue #548: pending vesting claim awaiting finalization or reversal
-    VestingPendingClaim(u64),
-    // Issue #550: set of passkeys flagged as compromised
-    CompromisedPasskeys(u64),
+    // Hibernation: temporary suspension of check-in requirement
+    Hibernation(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -218,6 +254,7 @@ pub struct CheckInStreak {
 /// A vesting schedule attached to a vault.
 /// Funds are released in `num_installments` equal tranches, each separated by `interval` seconds.
 /// The first installment becomes claimable at `start_time`.
+/// If `cliff_period` > 0, no installments can be claimed until `start_time + cliff_period` has elapsed.
 #[contracttype]
 #[derive(Clone)]
 pub struct VestingSchedule {
@@ -232,6 +269,9 @@ pub struct VestingSchedule {
     /// Total amount to vest (in stroops). Each installment = total_amount / num_installments,
     /// with the last installment absorbing any remainder.
     pub total_amount: i128,
+    /// Cliff duration in seconds from `start_time`. No funds are claimable until
+    /// `start_time + cliff_period` has elapsed. Set to 0 to disable.
+    pub cliff_period: u64,
 }
 
 #[contracttype]
@@ -240,6 +280,7 @@ pub enum ReleaseStatus {
     Locked,
     Released,
     Cancelled,
+    EmergencyFrozen,
 }
 
 #[contracttype]
@@ -258,13 +299,18 @@ pub struct ReleaseEvent {
     pub amount: i128,
 }
 
-/// A single beneficiary entry: (address, basis_points).
+/// A single beneficiary entry: (address, basis_points, minimum_threshold).
 /// All entries in a vault's beneficiaries must sum to 10_000 bps (100%).
+/// If a beneficiary's calculated share is below minimum_threshold (in stroops),
+/// they receive nothing and those funds are redistributed to other beneficiaries.
+/// Set to 0 to disable the minimum threshold for this beneficiary.
 #[contracttype]
 #[derive(Clone)]
 pub struct BeneficiaryEntry {
     pub address: Address,
     pub bps: u32,
+    /// Minimum amount in stroops. If calculated share < minimum_threshold, beneficiary gets 0.
+    pub minimum_threshold: i128,
 }
 
 /// Bridge configuration for cross-chain support.
@@ -346,6 +392,10 @@ pub struct Vault {
     pub withdrawal_approval_threshold: Option<i128>,
     /// Maximum amount releasable per trigger_release call - Issue #382
     pub spending_limit: Option<i128>,
+    /// Penalty in basis points deducted per missed check-in interval
+    pub inactivity_penalty_bps: Option<u32>,
+    /// Address that receives inactivity penalty transfers
+    pub penalty_recipient: Option<Address>,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -382,13 +432,50 @@ pub struct WithdrawalScheduleEntry {
     pub amount: i128,
 }
 
-/// Conditional acceptance entry - Issue #400
+/// Conditional acceptance entry - Issue #400, #503
 #[contracttype]
 #[derive(Clone)]
 pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
     pub acceptance_deadline: Option<u64>,
+    pub min_balance_threshold: Option<i128>,
+}
+
+/// Beneficiary conditional acceptance with threshold - Issue #503
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConditionalAcceptance {
+    pub min_balance_threshold: i128,
+    pub accepted_at: u64,
+}
+
+/// Beneficiary conflict claim - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflictClaim {
+    pub claimant: Address,
+    pub reason: String,
+    pub filed_at: u64,
+}
+
+/// Beneficiary conflict resolution - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub enum ConflictResolution {
+    Pending,
+    Approved(Address),
+    Rejected,
+}
+
+/// Beneficiary conflict entry - Issue #502
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryConflict {
+    pub vault_id: u64,
+    pub claims: Vec<BeneficiaryConflictClaim>,
+    pub resolution: ConflictResolution,
+    pub resolved_at: Option<u64>,
 }
 
 /// Activity log entry for forensic audit trail
@@ -555,70 +642,25 @@ pub struct BiometricEntry {
     pub added_at: u64,
 }
 
-/// TTL borrow record — tracks temporary TTL transfers between vaults.
+/// Hibernation entry — records when a vault entered hibernation and for how long.
+/// While hibernating, the vault's expiry deadline is extended by `duration_seconds`,
+/// so no check-ins are required during that period.
 #[contracttype]
 #[derive(Clone)]
-pub struct TtlBorrowRecord {
-    pub lender_vault_id: u64,
-    pub borrower_vault_id: u64,
-    pub borrowed_seconds: u64,
-    pub borrowed_at: u64,
-    pub repaid: bool,
+pub struct HibernationEntry {
+    /// Ledger timestamp when hibernation started.
+    pub started_at: u64,
+    /// How many seconds the hibernation lasts.
+    pub duration_seconds: u64,
 }
 
-/// Geographic check-in entry — stores location metadata for a check-in.
+/// Configurable countdown notification thresholds for a vault.
+/// Each threshold (in seconds before expiry) triggers a `cd_notif` event
+/// when `check_countdown` is called and the TTL crosses that boundary.
+/// Default thresholds: 7 days (604800), 3 days (259200), 1 day (86400).
 #[contracttype]
 #[derive(Clone)]
-pub struct GeoCheckInEntry {
-    pub latitude_micro: i64,
-    pub longitude_micro: i64,
-    pub country_code: String,
-    pub timestamp: u64,
-}
-
-/// Beneficiary proof-of-life entry — confirms beneficiary is reachable.
-#[contracttype]
-#[derive(Clone)]
-pub struct ProofOfLifeEntry {
-    pub beneficiary: Address,
-    pub submitted_at: u64,
-    pub valid_until: u64,
-}
-
-/// Beneficiary release vote — records an approval or rejection vote.
-#[contracttype]
-#[derive(Clone)]
-pub struct ReleaseVoteEntry {
-    pub voter: Address,
-    pub approve: bool,
-    pub voted_at: u64,
-}
-
-/// Vesting penalty config — Issue #547.
-/// Applied to installments claimed after `grace_period_seconds` past their unlock time.
-#[contracttype]
-#[derive(Clone)]
-pub struct VestingPenaltyConfig {
-    /// Penalty in basis points applied to each late installment (e.g. 500 = 5%).
-    pub penalty_bps: u32,
-    /// Seconds after an installment's unlock time before the penalty kicks in.
-    pub grace_period_seconds: u64,
-}
-
-/// Pending vesting claim — Issue #548.
-/// Created by `initiate_vesting_claim`; tokens remain escrowed until
-/// `finalize_vesting_claim` is called or the owner calls `reverse_vesting_claim`.
-#[contracttype]
-#[derive(Clone)]
-pub struct VestingPendingClaim {
-    /// Escrowed token amount (not yet transferred to beneficiary).
-    pub amount: i128,
-    pub beneficiary: Address,
-    pub initiated_at: u64,
-    /// Timestamp after which only finalization is possible (reversal window closed).
-    pub reversal_deadline: u64,
-    /// New schedule counter value set when this claim was initiated.
-    pub new_installments_claimed: u32,
-    /// Previous schedule counter value (restored on reversal).
-    pub prev_installments_claimed: u32,
+pub struct CountdownConfig {
+    /// Sorted descending list of thresholds in seconds (e.g. [604800, 259200, 86400]).
+    pub thresholds: Vec<u64>,
 }

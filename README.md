@@ -29,6 +29,8 @@ This Soroban implementation makes TTL-Legacy:
 - **Create a Vault**: Set a beneficiary address and check-in interval
 - **Check-In**: Extend the contract TTL to reset the countdown
 - **Automatic Release**: Funds transfer to beneficiary when TTL lapses
+- **Beneficiary Conditional Acceptance**: Beneficiary can accept role only if funds exceed threshold
+- **Beneficiary Conflict Resolution**: Automated conflict resolution when multiple beneficiaries claim same vault
 - **Passkey Auth**: WebAuthn-based authentication for all owner actions
 - **Reminder System**: Backend sends encrypted email/SMS check-in reminders
 - **Legacy Dashboard**: Minimalist frontend to manage vault state and history
@@ -125,11 +127,15 @@ The script will display the target network and identity, then require you to typ
 
 - [Architecture Overview](docs/architecture.md)
 - [TTL & State Archival Logic](docs/ttl-logic.md)
+- [Vault Hibernation](docs/hibernation.md)
 - [Passkey Integration](docs/passkeys.md)
+- [Beneficiary Conditional Acceptance](docs/beneficiary-conditional-acceptance.md)
+- [Beneficiary Conflict Resolution](docs/beneficiary-conflict-resolution.md)
 - [Threat Model & Security](docs/security.md)
 - [Security Policy & Vulnerability Disclosure](SECURITY.md)
 - [Roadmap](docs/roadmap.md)
 - [Vesting Schedules](docs/vesting-schedules.md)
+- [Beneficiary Advanced Features](docs/beneficiary-advanced-features.md)
 
 ## 🎓 Smart Contract API
 
@@ -156,6 +162,14 @@ update_beneficiary(vault_id: u64, new_beneficiary: Address)
 trigger_release(vault_id: u64)
 is_expired(vault_id: u64) -> bool
 get_release_status(vault_id: u64) -> ReleaseStatus
+```
+
+### Hibernation
+
+```rust
+enter_hibernation(vault_id: u64, caller: Address, duration_seconds: u64)
+exit_hibernation(vault_id: u64, caller: Address)
+get_hibernation(vault_id: u64) -> Option<HibernationEntry>
 ```
 
 ## 🧪 Testing
