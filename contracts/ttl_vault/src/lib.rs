@@ -6,6 +6,7 @@ use soroban_sdk::{
 };
 
 mod types;
+pub mod ranking;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
@@ -38,7 +39,8 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
-    EMERGENCY_FREEZE_TOPIC, FREEZE_RESOLVED_TOPIC,
+    HibernationEntry,
+    HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC,
 };
 
 #[cfg(test)]
@@ -149,7 +151,8 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
-    VaultFrozen = 55,
+    AlreadyHibernating = 55,
+    NotHibernating = 56,
 }
 
 #[contract]
@@ -604,6 +607,15 @@ impl TtlVaultContract {
                 panic_with_error!(&env, ContractError::InvalidBeneficiary);
             }
 
+            // Detect duplicate: same (owner, beneficiary, check_in_interval) already Locked
+            let fingerprint = Self::vault_fingerprint(&env, &owner, &beneficiary, check_in_interval);
+            let fp_key = DataKey::VaultFingerprint(fingerprint.clone());
+            if env.storage().persistent().has(&fp_key) {
+                let existing_id: u64 = env.storage().persistent().get(&fp_key).unwrap();
+                env.events().publish((DUPLICATE_VAULT_TOPIC,), (owner, beneficiary, check_in_interval, existing_id));
+                panic_with_error!(&env, ContractError::DuplicateVault);
+            }
+
             // Issue #470: enforce per-owner vault capacity limit
             let limit: u32 = env.storage()
                 .instance()
@@ -677,6 +689,9 @@ impl TtlVaultContract {
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
             
             Self::append_activity_log(&env, vault_id, "create_vault", &owner, "");
+            // Store fingerprint to prevent duplicate creation
+            env.storage().persistent().set(&fp_key, &vault_id);
+            env.storage().persistent().extend_ttl(&fp_key, VAULT_TTL_THRESHOLD, vault_ttl_ledgers(check_in_interval));
             env.events().publish(
                 (VAULT_CREATED_TOPIC,),
                 (vault_id, owner, beneficiary, check_in_interval, timestamp),
@@ -1262,6 +1277,9 @@ impl TtlVaultContract {
                 let arch_key = DataKey::ArchivedVault(vault_id);
                 env.storage().persistent().set(&arch_key, &ArchivedVaultInfo(vault.clone()));
                 env.storage().persistent().extend_ttl(&arch_key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+                // Remove fingerprint so the same parameters can be reused
+                let fp = Self::vault_fingerprint(&env, &vault.owner, &vault.beneficiary, vault.check_in_interval);
+                env.storage().persistent().remove(&DataKey::VaultFingerprint(fp));
                 env.events().publish((VAULT_ARCHIVED_TOPIC, vault_id), (vault_id, ReleaseStatus::Released));
             }
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -2028,7 +2046,20 @@ impl TtlVaultContract {
     pub fn is_expired(env: Env, vault_id: u64) -> bool {
         let vault = Self::load_vault(&env, vault_id);
         let now = env.ledger().timestamp();
-        now >= vault.last_check_in + vault.check_in_interval
+        // Compute how many seconds of hibernation have elapsed (capped at duration).
+        let hibernated = if let Some(h) = env.storage().persistent()
+            .get::<DataKey, HibernationEntry>(&DataKey::Hibernation(vault_id))
+        {
+            let elapsed = now.saturating_sub(h.started_at).min(h.duration_seconds);
+            // If still inside the hibernation window, vault cannot expire.
+            if elapsed < h.duration_seconds {
+                return false;
+            }
+            h.duration_seconds
+        } else {
+            0u64
+        };
+        now >= vault.last_check_in + vault.check_in_interval + hibernated
     }
 
     /// Retrieves a vault by its unique identifier.
@@ -2590,6 +2621,9 @@ impl TtlVaultContract {
         Self::save_vault(&env, vault_id, &vault);
         Self::remove_owner_vault_id(&env, &vault.owner, vault_id, vault.check_in_interval);
         Self::remove_beneficiary_vault_id(&env, &vault.beneficiary, vault_id, vault.check_in_interval);
+        // Remove fingerprint so the same parameters can be reused
+        let fp = Self::vault_fingerprint(&env, &vault.owner, &vault.beneficiary, vault.check_in_interval);
+        env.storage().persistent().remove(&DataKey::VaultFingerprint(fp));
         Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Cancelled, &caller);
         Self::log_audit_entry(&env, vault_id, "cancel_vault", &caller, "");
         Self::append_activity_log(&env, vault_id, "cancel_vault", &caller, "");
@@ -3593,6 +3627,18 @@ impl TtlVaultContract {
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage().persistent().set(&key, vault);
         env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+    }
+
+    /// Compute a 32-byte fingerprint for (owner, beneficiary, check_in_interval).
+    /// Used to detect duplicate vault creation attempts.
+    fn vault_fingerprint(env: &Env, owner: &Address, beneficiary: &Address, check_in_interval: u64) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        buf.append(&owner.clone().to_xdr(env));
+        buf.append(&beneficiary.clone().to_xdr(env));
+        for b in check_in_interval.to_be_bytes().iter() {
+            buf.push_back(*b);
+        }
+        env.crypto().sha256(&buf)
     }
 
     fn load_beneficiary_vault_ids(env: &Env, beneficiary: &Address) -> Vec<u64> {
@@ -5850,62 +5896,107 @@ impl TtlVaultContract {
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
     }
 
-    // ── Emergency Freeze ─────────────────────────────────────────────────────
+    // ── Hibernation ──────────────────────────────────────────────────────────
 
-    /// Freezes a vault in response to a suspected owner compromise.
+    /// Puts a vault into hibernation for `duration_seconds`.
     ///
-    /// Only the vault's primary beneficiary (or a listed multi-beneficiary) may
-    /// call this. While frozen, all owner-only operations (withdraw,
-    /// update_beneficiary, cancel_vault) are blocked.
+    /// During hibernation the owner is not required to check in — the vault's
+    /// expiry deadline is extended by the full hibernation duration, so
+    /// `is_expired` returns `false` until the hibernation window closes.
+    /// Normal operations (deposit, withdraw, check_in) remain available.
     ///
     /// # Arguments
-    /// * `vault_id` - The vault to freeze
-    /// * `caller`   - Must be a beneficiary of the vault (requires auth)
+    /// * `vault_id`         - The vault to hibernate
+    /// * `caller`           - Must be the vault owner
+    /// * `duration_seconds` - How long (in seconds) the hibernation lasts (> 0)
     ///
     /// # Errors
-    /// * `ContractError::NotBeneficiary` - If caller is not a beneficiary
-    /// * `ContractError::AlreadyReleased` - If vault is not in Locked status
-    pub fn emergency_freeze(env: Env, vault_id: u64, caller: Address) -> Result<(), ContractError> {
+    /// * `ContractError::NotOwner`          - Caller is not the vault owner
+    /// * `ContractError::AlreadyReleased`   - Vault is not Locked
+    /// * `ContractError::AlreadyHibernating`- Vault is already hibernating
+    /// * `ContractError::InvalidInterval`   - `duration_seconds` is zero
+    pub fn enter_hibernation(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        duration_seconds: u64,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
-        let mut vault = Self::load_vault(&env, vault_id);
-        let is_beneficiary = caller == vault.beneficiary
-            || vault.beneficiaries.iter().any(|e| e.address == caller);
-        if !is_beneficiary {
-            return Err(ContractError::NotBeneficiary);
+        if duration_seconds == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
         }
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        vault.status = ReleaseStatus::EmergencyFrozen;
-        Self::save_vault(&env, vault_id, &vault);
-        Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::EmergencyFrozen, &caller);
+        let hib_key = DataKey::Hibernation(vault_id);
+        if env.storage().persistent().has(&hib_key) {
+            return Err(ContractError::AlreadyHibernating);
+        }
+        let now = env.ledger().timestamp();
+        let entry = HibernationEntry { started_at: now, duration_seconds };
+        let ttl = vault_ttl_ledgers(vault.check_in_interval + duration_seconds);
+        env.storage().persistent().set(&hib_key, &entry);
+        env.storage().persistent().extend_ttl(&hib_key, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((EMERGENCY_FREEZE_TOPIC, vault_id), caller);
+        env.events().publish(
+            (HIBERNATION_ENTERED_TOPIC, vault_id),
+            (caller, now, duration_seconds),
+        );
         Ok(())
     }
 
-    /// Resolves an emergency freeze, returning the vault to Locked status.
+    /// Exits hibernation early, resuming normal check-in requirements.
     ///
-    /// Only the contract admin may call this after investigating the situation.
+    /// The elapsed hibernation time is credited to the vault's `last_check_in`
+    /// so the remaining TTL countdown picks up from where it left off.
     ///
     /// # Arguments
-    /// * `vault_id` - The vault to unfreeze
+    /// * `vault_id` - The vault to wake from hibernation
+    /// * `caller`   - Must be the vault owner
     ///
     /// # Errors
-    /// * `ContractError::NotAdmin`       - If caller is not the admin
-    /// * `ContractError::AlreadyReleased` - If vault is not EmergencyFrozen
-    pub fn resolve_emergency_freeze(env: Env, vault_id: u64) -> Result<(), ContractError> {
-        Self::require_admin(&env);
+    /// * `ContractError::NotOwner`        - Caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - Vault is not Locked
+    /// * `ContractError::NotHibernating`  - Vault is not currently hibernating
+    pub fn exit_hibernation(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
         let mut vault = Self::load_vault(&env, vault_id);
-        if vault.status != ReleaseStatus::EmergencyFrozen {
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        vault.status = ReleaseStatus::Locked;
-        let admin = Self::load_admin(&env);
+        let hib_key = DataKey::Hibernation(vault_id);
+        let entry = env.storage().persistent()
+            .get::<DataKey, HibernationEntry>(&hib_key)
+            .ok_or(ContractError::NotHibernating)?;
+        let now = env.ledger().timestamp();
+        // Credit elapsed hibernation time so the TTL countdown resumes correctly.
+        let elapsed = now.saturating_sub(entry.started_at).min(entry.duration_seconds);
+        vault.last_check_in = vault.last_check_in.saturating_add(elapsed);
+        env.storage().persistent().remove(&hib_key);
         Self::save_vault(&env, vault_id, &vault);
-        Self::record_state_transition(&env, vault_id, ReleaseStatus::EmergencyFrozen, ReleaseStatus::Locked, &admin);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((FREEZE_RESOLVED_TOPIC, vault_id), admin);
+        env.events().publish(
+            (HIBERNATION_EXITED_TOPIC, vault_id),
+            (caller, now, elapsed),
+        );
         Ok(())
+    }
+
+    /// Returns the current hibernation entry for a vault, if it is hibernating.
+    pub fn get_hibernation(env: Env, vault_id: u64) -> Option<HibernationEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Hibernation(vault_id))
     }
 }
