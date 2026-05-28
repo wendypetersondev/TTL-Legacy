@@ -15,6 +15,7 @@ use types::{
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
     TtlBorrowRecord,
     GeoCheckInEntry,
+    BeneficiaryCommitment,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -3397,6 +3398,141 @@ impl TtlVaultContract {
                 env.events().publish((RESTORE_VAULT_TOPIC, vault_id), vault_id);
             }
         }
+    }
+
+    // ── Beneficiary Anonymity (ZK commitment) ────────────────────────────────
+
+    /// Commits to an anonymous beneficiary using a hash commitment.
+    ///
+    /// The owner stores `sha256(beneficiary_address_bytes)` instead of the
+    /// plaintext address. The actual beneficiary remains hidden until
+    /// `reveal_beneficiary` is called at release time.
+    ///
+    /// A vault may have at most one active commitment. Call again to replace.
+    ///
+    /// # Arguments
+    /// * `vault_id`   - The vault to attach the commitment to
+    /// * `caller`     - Must be the vault owner (requires auth)
+    /// * `commitment` - SHA-256 hash of the beneficiary address bytes
+    ///
+    /// # Errors
+    /// * `NotOwner`              - caller is not the vault owner
+    /// * `AlreadyReleased`       - vault is not Locked
+    /// * `CommitmentAlreadySet`  - a commitment already exists (must reveal first)
+    pub fn commit_beneficiary(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        commitment: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let key = DataKey::BeneficiaryCommitment(vault_id);
+        if env.storage().persistent().has(&key) {
+            return Err(ContractError::CommitmentAlreadySet);
+        }
+        let entry = BeneficiaryCommitment {
+            commitment: commitment.clone(),
+            committed_at: env.ledger().timestamp(),
+        };
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((BEN_COMMITTED_TOPIC, vault_id), commitment);
+        Ok(())
+    }
+
+    /// Reveals the anonymous beneficiary and releases vault funds.
+    ///
+    /// Anyone may call this once the vault has expired. The `proof` bytes must
+    /// be the raw address bytes of the beneficiary such that
+    /// `sha256(proof) == stored_commitment`. On success the revealed address
+    /// receives the vault balance and the vault is marked Released.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to release
+    /// * `proof`    - Raw bytes whose SHA-256 equals the stored commitment
+    /// * `claim`    - The `Address` being claimed (must match `sha256(proof)`)
+    ///
+    /// # Errors
+    /// * `CommitmentNotFound`        - no commitment was stored for this vault
+    /// * `BeneficiaryAlreadyRevealed`- funds already released via this path
+    /// * `NotExpired`                - vault has not yet expired
+    /// * `EmptyVault`                - vault balance is zero
+    /// * `InvalidZkProof`            - sha256(proof) does not match commitment
+    pub fn reveal_beneficiary(
+        env: Env,
+        vault_id: u64,
+        proof: Bytes,
+        claim: Address,
+    ) -> Result<(), ContractError> {
+        let com_key = DataKey::BeneficiaryCommitment(vault_id);
+        let entry: BeneficiaryCommitment = env
+            .storage()
+            .persistent()
+            .get(&com_key)
+            .ok_or(ContractError::CommitmentNotFound)?;
+
+        if env.storage().persistent().has(&DataKey::RevealedBeneficiary(vault_id)) {
+            return Err(ContractError::BeneficiaryAlreadyRevealed);
+        }
+
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::BeneficiaryAlreadyRevealed);
+        }
+        if !Self::is_expired(env.clone(), vault_id) {
+            return Err(ContractError::NotExpired);
+        }
+        if vault.balance == 0 {
+            return Err(ContractError::EmptyVault);
+        }
+
+        // Verify: sha256(proof) must equal the stored commitment
+        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
+        if proof_hash != entry.commitment {
+            return Err(ContractError::InvalidZkProof);
+        }
+
+        let amount = vault.balance;
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &claim, &amount);
+
+        vault.balance = 0;
+        vault.status = ReleaseStatus::Released;
+        Self::save_vault(&env, vault_id, &vault);
+
+        // Mark as revealed so it cannot be called again
+        let rev_key = DataKey::RevealedBeneficiary(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&rev_key, &claim);
+        env.storage().persistent().extend_ttl(&rev_key, VAULT_TTL_THRESHOLD, ttl);
+
+        Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Released, &claim);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((BEN_REVEALED_TOPIC, vault_id), (claim, amount));
+        Ok(())
+    }
+
+    /// Returns the beneficiary commitment for a vault, if one exists.
+    pub fn get_beneficiary_commitment(env: Env, vault_id: u64) -> Option<BeneficiaryCommitment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BeneficiaryCommitment(vault_id))
+    }
+
+    /// Returns the revealed beneficiary address for a vault, if already revealed.
+    pub fn get_revealed_beneficiary(env: Env, vault_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RevealedBeneficiary(vault_id))
     }
 
     // --- helpers ---
