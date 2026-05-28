@@ -79,6 +79,11 @@ pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
 pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
 // Issue #475: batch status query
 pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("b_stat");
+// Issue #498: beneficiary proof of life
+pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
+// Issue #499: beneficiary voting
+pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
+pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -149,6 +154,11 @@ pub enum DataKey {
     CheckInNonce(u64),
     // Issue #480: check-in delegates
     CheckInDelegates(u64),
+    // Issue #498: beneficiary proof of life
+    ProofOfLife(u64),
+    // Issue #499: beneficiary release votes
+    ReleaseVotes(u64),
+    ReleaseVoteThreshold(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -474,4 +484,23 @@ pub struct VaultStatusSummary {
     pub balance: i128,
     pub last_check_in: u64,
     pub is_expired: bool,
+}
+
+/// Proof of life entry for a beneficiary - Issue #498
+/// Records that a beneficiary has proven liveness before release.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProofOfLifeEntry {
+    pub beneficiary: Address,
+    pub submitted_at: u64,
+    pub valid_until: u64,
+}
+
+/// A single beneficiary vote on release - Issue #499
+#[contracttype]
+#[derive(Clone)]
+pub struct ReleaseVoteEntry {
+    pub voter: Address,
+    pub approve: bool,
+    pub voted_at: u64,
 }

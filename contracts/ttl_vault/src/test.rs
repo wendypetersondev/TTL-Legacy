@@ -3922,3 +3922,128 @@ fn test_remove_nonexistent_delegate_fails() {
     let err = client.try_remove_check_in_delegate(&id, &owner, &delegate).unwrap_err().unwrap();
     assert_eq!(err, soroban_sdk::Error::from_contract_error(27)); // PasskeyNotFound (reused)
 }
+
+// ── Issue #498: Beneficiary Proof of Life ────────────────────────────────────
+
+#[test]
+fn test_submit_proof_of_life_success() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.submit_proof_of_life(&id, &beneficiary, &86400u64).unwrap();
+
+    let pol = client.get_proof_of_life(&id).unwrap();
+    assert_eq!(pol.beneficiary, beneficiary);
+    assert!(pol.valid_until > pol.submitted_at);
+}
+
+#[test]
+fn test_submit_proof_of_life_non_beneficiary_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_submit_proof_of_life(&id, &stranger, &86400u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(30)); // NotBeneficiary
+}
+
+#[test]
+fn test_proof_of_life_validity_window_capped() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // Request 60 days — should be capped at 30 days (2_592_000 s)
+    client.submit_proof_of_life(&id, &beneficiary, &5_184_000u64).unwrap();
+    let pol = client.get_proof_of_life(&id).unwrap();
+    assert_eq!(pol.valid_until - pol.submitted_at, 2_592_000u64);
+}
+
+#[test]
+fn test_get_proof_of_life_none_when_not_submitted() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert!(client.get_proof_of_life(&id).is_none());
+}
+
+// ── Issue #499: Beneficiary Voting ───────────────────────────────────────────
+
+#[test]
+fn test_set_and_get_release_vote_threshold() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_release_vote_threshold(&id, &owner, &1u32).unwrap();
+    assert_eq!(client.get_release_vote_threshold(&id), Some(1u32));
+}
+
+#[test]
+fn test_set_threshold_zero_removes_it() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_release_vote_threshold(&id, &owner, &2u32).unwrap();
+    client.set_release_vote_threshold(&id, &owner, &0u32).unwrap();
+    assert!(client.get_release_vote_threshold(&id).is_none());
+}
+
+#[test]
+fn test_set_threshold_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_set_release_vote_threshold(&id, &stranger, &1u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_cast_release_vote_success() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_release_vote_threshold(&id, &owner, &1u32).unwrap();
+    client.cast_release_vote(&id, &beneficiary, &true).unwrap();
+
+    let votes = client.get_release_votes(&id);
+    assert_eq!(votes.len(), 1);
+    assert_eq!(votes.get(0).unwrap().voter, beneficiary);
+    assert!(votes.get(0).unwrap().approve);
+}
+
+#[test]
+fn test_cast_release_vote_no_threshold_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_cast_release_vote(&id, &beneficiary, &true).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(54)); // VotingNotEnabled
+}
+
+#[test]
+fn test_cast_release_vote_non_beneficiary_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_release_vote_threshold(&id, &owner, &1u32).unwrap();
+    let err = client.try_cast_release_vote(&id, &stranger, &true).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(30)); // NotBeneficiary
+}
+
+#[test]
+fn test_cast_release_vote_double_vote_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_release_vote_threshold(&id, &owner, &2u32).unwrap();
+    client.cast_release_vote(&id, &beneficiary, &true).unwrap();
+    let err = client.try_cast_release_vote(&id, &beneficiary, &false).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(53)); // AlreadyVoted
+}
+
+#[test]
+fn test_get_release_votes_empty_by_default() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert_eq!(client.get_release_votes(&id).len(), 0);
+}

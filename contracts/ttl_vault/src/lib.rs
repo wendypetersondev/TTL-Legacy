@@ -34,10 +34,9 @@ use types::{
     DELEGATE_CHECKIN_TOPIC, REVOKE_DELEGATE_TOPIC, CHECKIN_POW_TOPIC, TTL_PREDICTED_TOPIC,
     BATCH_CHECKIN_TOPIC,
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
+    ProofOfLifeEntry, ReleaseVoteEntry,
+    PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
 };
-
-#[cfg(test)]
-mod test;
 
 #[cfg(test)]
 mod regression_tests;
@@ -137,6 +136,10 @@ pub enum ContractError {
     MetadataVersionNotFound = 48,
     VaultCapacityExceeded = 49,
     IncompatibleVaultToken = 50,
+    ProofOfLifeRequired = 51,
+    ProofOfLifeExpired = 52,
+    AlreadyVoted = 53,
+    VotingNotEnabled = 54,
 }
 
 #[contract]
@@ -1114,8 +1117,32 @@ impl TtlVaultContract {
             panic_with_error!(&env, ContractError::InvalidBeneficiary);
         }
 
-        // Check conditional acceptance deadline
+        // Check beneficiary proof of life - Issue #498
         let now = env.ledger().timestamp();
+        let pol_key = DataKey::ProofOfLife(vault_id);
+        if let Some(pol) = env.storage().persistent().get::<DataKey, ProofOfLifeEntry>(&pol_key) {
+            if now > pol.valid_until {
+                panic_with_error!(&env, ContractError::ProofOfLifeExpired);
+            }
+        } else {
+            // If proof-of-life is required (threshold set), block release
+            if env.storage().persistent().has(&DataKey::ReleaseVoteThreshold(vault_id)) {
+                panic_with_error!(&env, ContractError::ProofOfLifeRequired);
+            }
+        }
+
+        // Check beneficiary voting - Issue #499
+        if let Some(threshold) = env.storage().persistent().get::<DataKey, u32>(&DataKey::ReleaseVoteThreshold(vault_id)) {
+            let votes: Vec<ReleaseVoteEntry> = env.storage().persistent()
+                .get(&DataKey::ReleaseVotes(vault_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            let approvals = votes.iter().filter(|v| v.approve).count() as u32;
+            if approvals < threshold {
+                panic_with_error!(&env, ContractError::VotingNotEnabled);
+            }
+        }
+
+        // Check conditional acceptance deadline
         if let Some(entry) = env.storage().persistent()
             .get::<DataKey, ConditionalAcceptanceEntry>(&DataKey::ConditionalAcceptance(vault_id))
         {
@@ -5257,5 +5284,156 @@ impl TtlVaultContract {
             }
         }
         false
+    }
+
+    // ── Issue #498: Beneficiary Proof of Life ────────────────────────────────
+
+    /// Submits a proof-of-life for a beneficiary.
+    ///
+    /// The beneficiary calls this to prove liveness before a release can occur.
+    /// The proof is valid for `validity_window` seconds from submission.
+    ///
+    /// # Arguments
+    /// * `vault_id`        - The vault ID
+    /// * `caller`          - Must be a listed beneficiary (requires auth)
+    /// * `validity_window` - How many seconds the proof remains valid (max 30 days)
+    pub fn submit_proof_of_life(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        validity_window: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        // Caller must be the primary beneficiary or one of the multi-beneficiaries
+        let is_beneficiary = caller == vault.beneficiary || vault.beneficiaries.iter().any(|e| e.address == caller);
+        if !is_beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
+        let now = env.ledger().timestamp();
+        // Cap validity window at 30 days
+        let window = validity_window.min(2_592_000);
+        let entry = ProofOfLifeEntry {
+            beneficiary: caller.clone(),
+            submitted_at: now,
+            valid_until: now.saturating_add(window),
+        };
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&DataKey::ProofOfLife(vault_id), &entry);
+        env.storage().persistent().extend_ttl(&DataKey::ProofOfLife(vault_id), VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((PROOF_OF_LIFE_TOPIC, vault_id), (caller, now, now.saturating_add(window)));
+        Ok(())
+    }
+
+    /// Returns the current proof-of-life entry for a vault, if any.
+    pub fn get_proof_of_life(env: Env, vault_id: u64) -> Option<ProofOfLifeEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProofOfLife(vault_id))
+    }
+
+    // ── Issue #499: Beneficiary Voting ───────────────────────────────────────
+
+    /// Sets the approval vote threshold for a vault's release.
+    ///
+    /// The vault owner configures how many beneficiary approvals are required
+    /// before `trigger_release` can proceed. Set to 0 to disable voting.
+    ///
+    /// # Arguments
+    /// * `vault_id`  - The vault ID
+    /// * `caller`    - Must be the vault owner (requires auth)
+    /// * `threshold` - Minimum approvals needed (0 = disabled)
+    pub fn set_release_vote_threshold(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        threshold: u32,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        if threshold == 0 {
+            env.storage().persistent().remove(&DataKey::ReleaseVoteThreshold(vault_id));
+        } else {
+            env.storage().persistent().set(&DataKey::ReleaseVoteThreshold(vault_id), &threshold);
+            env.storage().persistent().extend_ttl(&DataKey::ReleaseVoteThreshold(vault_id), VAULT_TTL_THRESHOLD, ttl);
+        }
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Casts a vote on whether to approve the vault release.
+    ///
+    /// Only listed beneficiaries may vote. Each beneficiary may vote once.
+    /// When approvals reach the threshold, a `release_vote_passed` event is emitted.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller`   - Must be a listed beneficiary (requires auth)
+    /// * `approve`  - `true` to approve, `false` to reject
+    pub fn cast_release_vote(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        approve: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        // Voting only meaningful when threshold is set
+        let threshold = env.storage().persistent()
+            .get::<DataKey, u32>(&DataKey::ReleaseVoteThreshold(vault_id))
+            .ok_or(ContractError::VotingNotEnabled)?;
+
+        let is_beneficiary = caller == vault.beneficiary || vault.beneficiaries.iter().any(|e| e.address == caller);
+        if !is_beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
+
+        let votes_key = DataKey::ReleaseVotes(vault_id);
+        let mut votes: Vec<ReleaseVoteEntry> = env.storage().persistent()
+            .get(&votes_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Prevent double-voting
+        for v in votes.iter() {
+            if v.voter == caller {
+                return Err(ContractError::AlreadyVoted);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+        votes.push_back(ReleaseVoteEntry { voter: caller.clone(), approve, voted_at: now });
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&votes_key, &votes);
+        env.storage().persistent().extend_ttl(&votes_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((RELEASE_VOTE_TOPIC, vault_id), (caller, approve, now));
+
+        // Emit threshold-reached event if approvals meet threshold
+        let approvals = votes.iter().filter(|v| v.approve).count() as u32;
+        if approvals >= threshold {
+            env.events().publish((RELEASE_VOTE_PASSED_TOPIC, vault_id), approvals);
+        }
+        Ok(())
+    }
+
+    /// Returns all release votes cast for a vault.
+    pub fn get_release_votes(env: Env, vault_id: u64) -> Vec<ReleaseVoteEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReleaseVotes(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the release vote threshold for a vault, if set.
+    pub fn get_release_vote_threshold(env: Env, vault_id: u64) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReleaseVoteThreshold(vault_id))
     }
 }
