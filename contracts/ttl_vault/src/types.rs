@@ -21,6 +21,8 @@ pub const PAUSE_TOPIC: Symbol = symbol_short!("pause");
 pub const UNPAUSE_TOPIC: Symbol = symbol_short!("unpause");
 pub const SET_VESTING_TOPIC: Symbol = symbol_short!("set_vest");
 pub const CLAIM_VEST_TOPIC: Symbol = symbol_short!("clm_vest");
+// Issue #534: vesting cliff period reached
+pub const CLIFF_REACHED_TOPIC: Symbol = symbol_short!("clif_rch");
 pub const PAUSE_VAULT_TOPIC: Symbol = symbol_short!("v_pause");
 pub const RESUME_VAULT_TOPIC: Symbol = symbol_short!("v_resume");
 pub const SET_METADATA_TOPIC: Symbol = symbol_short!("set_meta");
@@ -85,6 +87,9 @@ pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
 // Issue #499: beneficiary voting
 pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
 pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
+// Hibernation events
+pub const HIBERNATION_ENTERED_TOPIC: Symbol = symbol_short!("hib_ent");
+pub const HIBERNATION_EXITED_TOPIC: Symbol = symbol_short!("hib_ext");
 
 // Previously missing — used by lib.rs internal helpers
 pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
@@ -110,8 +115,35 @@ pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 // Issue: Accelerated TTL Decay
 pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 
+// Emergency freeze events
+pub const EMERGENCY_FREEZE_TOPIC: Symbol = symbol_short!("emg_frz");
+pub const FREEZE_RESOLVED_TOPIC: Symbol = symbol_short!("frz_res");
+
+// Beneficiary rotation
+pub const BEN_ROTATION_TOPIC: Symbol = symbol_short!("ben_rot");
+
+// Inactivity penalty
+pub const INACTIVITY_PENALTY_TOPIC: Symbol = symbol_short!("inact_pen");
+
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
+
+// Issue #494: Beneficiary Succession Planning
+pub const SUCCESSION_SET_TOPIC: Symbol = symbol_short!("suc_set");
+pub const SUCCESSION_ACTIVATED_TOPIC: Symbol = symbol_short!("suc_act");
+
+// Issue #495: Beneficiary Escrow
+pub const ESCROW_CREATED_TOPIC: Symbol = symbol_short!("esc_cre");
+pub const ESCROW_ACCEPTED_TOPIC: Symbol = symbol_short!("esc_acc");
+pub const ESCROW_REJECTED_TOPIC: Symbol = symbol_short!("esc_rej");
+pub const ESCROW_EXPIRED_TOPIC: Symbol = symbol_short!("esc_exp");
+
+// Issue #496: Dispute Arbitration
+pub const ARBITRATOR_SET_TOPIC: Symbol = symbol_short!("arb_set");
+pub const ARBITRATION_RULED_TOPIC: Symbol = symbol_short!("arb_rul");
+
+// Issue #497: Beneficiary Notification
+pub const VAULT_NOTIFY_TOPIC: Symbol = symbol_short!("v_notif");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -189,12 +221,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
-    // Vault state snapshots
-    VaultSnapshot(u64, u32),
-    VaultSnapshotCount(u64),
-    // Countdown notification config
-    CountdownConfig(u64),
-    CountdownFired(u64),
+    // Hibernation: temporary suspension of check-in requirement
+    Hibernation(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -216,6 +244,7 @@ pub struct CheckInStreak {
 /// A vesting schedule attached to a vault.
 /// Funds are released in `num_installments` equal tranches, each separated by `interval` seconds.
 /// The first installment becomes claimable at `start_time`.
+/// If `cliff_period` > 0, no installments can be claimed until `start_time + cliff_period` has elapsed.
 #[contracttype]
 #[derive(Clone)]
 pub struct VestingSchedule {
@@ -230,6 +259,9 @@ pub struct VestingSchedule {
     /// Total amount to vest (in stroops). Each installment = total_amount / num_installments,
     /// with the last installment absorbing any remainder.
     pub total_amount: i128,
+    /// Cliff duration in seconds from `start_time`. No funds are claimable until
+    /// `start_time + cliff_period` has elapsed. Set to 0 to disable.
+    pub cliff_period: u64,
 }
 
 #[contracttype]
@@ -238,6 +270,7 @@ pub enum ReleaseStatus {
     Locked,
     Released,
     Cancelled,
+    EmergencyFrozen,
 }
 
 #[contracttype]
@@ -256,13 +289,18 @@ pub struct ReleaseEvent {
     pub amount: i128,
 }
 
-/// A single beneficiary entry: (address, basis_points).
+/// A single beneficiary entry: (address, basis_points, minimum_threshold).
 /// All entries in a vault's beneficiaries must sum to 10_000 bps (100%).
+/// If a beneficiary's calculated share is below minimum_threshold (in stroops),
+/// they receive nothing and those funds are redistributed to other beneficiaries.
+/// Set to 0 to disable the minimum threshold for this beneficiary.
 #[contracttype]
 #[derive(Clone)]
 pub struct BeneficiaryEntry {
     pub address: Address,
     pub bps: u32,
+    /// Minimum amount in stroops. If calculated share < minimum_threshold, beneficiary gets 0.
+    pub minimum_threshold: i128,
 }
 
 /// Bridge configuration for cross-chain support.
@@ -344,6 +382,10 @@ pub struct Vault {
     pub withdrawal_approval_threshold: Option<i128>,
     /// Maximum amount releasable per trigger_release call - Issue #382
     pub spending_limit: Option<i128>,
+    /// Penalty in basis points deducted per missed check-in interval
+    pub inactivity_penalty_bps: Option<u32>,
+    /// Address that receives inactivity penalty transfers
+    pub penalty_recipient: Option<Address>,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -553,19 +595,16 @@ pub struct BiometricEntry {
     pub added_at: u64,
 }
 
-/// A point-in-time snapshot of vault state for disaster recovery.
+/// Hibernation entry — records when a vault entered hibernation and for how long.
+/// While hibernating, the vault's expiry deadline is extended by `duration_seconds`,
+/// so no check-ins are required during that period.
 #[contracttype]
 #[derive(Clone)]
-pub struct VaultSnapshot {
-    pub snapshot_id: u32,
-    pub vault_id: u64,
-    pub taken_at: u64,
-    pub balance: i128,
-    pub beneficiary: Address,
-    pub check_in_interval: u64,
-    pub last_check_in: u64,
-    pub metadata: String,
-    pub is_paused: bool,
+pub struct HibernationEntry {
+    /// Ledger timestamp when hibernation started.
+    pub started_at: u64,
+    /// How many seconds the hibernation lasts.
+    pub duration_seconds: u64,
 }
 
 /// Configurable countdown notification thresholds for a vault.
