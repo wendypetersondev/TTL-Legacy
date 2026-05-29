@@ -153,6 +153,15 @@ pub const PASSKEY_ROTATION_ENFORCED_TOPIC: Symbol = symbol_short!("pk_rot_e");
 pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
 pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 
+// Issue #541: Vesting Rollover
+pub const VESTING_ROLLOVER_TOPIC: Symbol = symbol_short!("vest_rol");
+// Issue #542: Vesting Forfeiture
+pub const VESTING_FORFEITURE_TOPIC: Symbol = symbol_short!("vest_frf");
+// Issue #543: Vesting Acceleration on Death
+pub const VESTING_ACCELERATED_TOPIC: Symbol = symbol_short!("vest_acc");
+// Issue #544: Vesting Staggering
+pub const VESTING_STAGGER_TOPIC: Symbol = symbol_short!("vest_stg");
+
 // Vault state snapshots
 pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
 pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
