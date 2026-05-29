@@ -9,6 +9,7 @@ mod types;
 pub mod ranking;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
+    MilestoneEntry, MilestoneVestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
     ArchivedVaultInfo, OwnershipTransferRequest, PendingBeneficiaryUpdate, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
@@ -753,7 +754,7 @@ impl TtlVaultContract {
                 .get::<DataKey, u64>(&DataKey::LastCheckInTime(vault_id))
             {
                 if now < last + cooldown {
-                    return Err(ContractError::CheckInTooFrequent);
+                    return Err(ContractError::InvalidInterval);
                 }
             }
         }
@@ -1198,7 +1199,7 @@ impl TtlVaultContract {
         let pol_key = DataKey::ProofOfLife(vault_id);
         if let Some(pol) = env.storage().persistent().get::<DataKey, ProofOfLifeEntry>(&pol_key) {
             if now > pol.valid_until {
-                panic_with_error!(&env, ContractError::ProofOfLifeExpired);
+                panic_with_error!(&env, ContractError::ProofOfLifeRequired);
             }
         } else {
             // If proof-of-life is required (threshold set), block release
@@ -1266,8 +1267,12 @@ impl TtlVaultContract {
             .storage()
             .persistent()
             .has(&DataKey::VestingSchedule(vault_id));
+        let has_milestone_vesting = env
+            .storage()
+            .persistent()
+            .has(&DataKey::MilestoneVestingSchedule(vault_id));
 
-        if has_vesting {
+        if has_vesting || has_milestone_vesting {
             // Vesting schedule exists: mark as Released but keep balance intact
             vault.status = ReleaseStatus::Released;
             Self::save_vault(&env, vault_id, &vault);
@@ -2521,6 +2526,524 @@ impl TtlVaultContract {
         env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(amount)
+    }
+
+    // --- milestone-based vesting ---
+
+    /// Sets a milestone-based vesting schedule for a vault.
+    ///
+    /// Instead of releasing funds on a time-based schedule, funds are unlocked
+    /// when external milestones (e.g., company revenue targets) are fulfilled.
+    /// An oracle address is designated to report progress on each milestone.
+    ///
+    /// The vault must be Locked, have a non-zero balance, and must not already
+    /// have a time-based vesting schedule attached.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault to attach the milestone schedule to
+    /// * `caller` - Must be the vault owner
+    /// * `milestones` - Vector of MilestoneEntry defining each milestone (target, BPS, label)
+    /// * `oracle` - Address authorized to report milestone progress
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - If vault is not Locked
+    /// * `ContractError::EmptyVault` - If vault balance is 0
+    /// * `ContractError::InvalidBps` - If milestone BPS does not sum to 10_000
+    /// * `ContractError::VestingAlreadySet` - If a time-based vesting schedule exists
+    pub fn set_milestone_vesting(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        milestones: Vec<MilestoneEntry>,
+        oracle: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if vault.balance == 0 {
+            return Err(ContractError::EmptyVault);
+        }
+        // Cannot have both time-based and milestone-based vesting
+        if env.storage().persistent().has(&DataKey::VestingSchedule(vault_id)) {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if milestones.is_empty() {
+            return Err(ContractError::InvalidBps);
+        }
+        let total_bps: u32 = milestones.iter().map(|m| m.bps).sum();
+        if total_bps != 10_000 {
+            return Err(ContractError::InvalidBps);
+        }
+        // Ensure no milestone is pre-fulfilled
+        for milestone in milestones.iter() {
+            if milestone.is_fulfilled {
+                return Err(ContractError::InvalidAmount);
+            }
+        }
+
+        let schedule = MilestoneVestingSchedule {
+            total_amount: vault.balance,
+            milestones,
+            claimed_amount: 0,
+            oracle,
+            paused: false,
+        };
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (MILESTONE_VEST_TOPIC, vault_id),
+            (schedule.total_amount, schedule.oracle.clone()),
+        );
+        Ok(())
+    }
+
+    /// Returns the milestone vesting schedule for a vault, if one exists.
+    pub fn get_milestone_vesting_schedule(env: Env, vault_id: u64) -> Option<MilestoneVestingSchedule> {
+        env.storage().persistent().get(&DataKey::MilestoneVestingSchedule(vault_id))
+    }
+
+    /// Pauses a milestone vesting schedule, blocking progress reporting and claiming.
+    ///
+    /// Only the vault owner can call this. The vesting state and milestone data are
+    /// preserved and can be resumed later via `resume_milestone_vesting`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    /// * `caller` - The address of the caller (must be vault owner)
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::VestingNotFound` - If no milestone vesting schedule exists
+    pub fn pause_milestone_vesting(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VestingNotFound)?;
+
+        if schedule.paused {
+            return Err(ContractError::Paused);
+        }
+        schedule.paused = true;
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MILESTONE_PAUSE_TOPIC, vault_id), true);
+        Ok(())
+    }
+
+    /// Resumes a paused milestone vesting schedule, re-enabling progress reporting and claiming.
+    ///
+    /// Only the vault owner can call this. All milestone progress and state is preserved
+    /// from before the pause.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    /// * `caller` - The address of the caller (must be vault owner)
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::VestingNotFound` - If no milestone vesting schedule exists
+    pub fn resume_milestone_vesting(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VestingNotFound)?;
+
+        if !schedule.paused {
+            return Err(ContractError::Paused);
+        }
+        schedule.paused = false;
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MILESTONE_RESUME_TOPIC, vault_id), false);
+        Ok(())
+    }
+
+    /// Adjusts milestone targets to slow down vesting.
+    ///
+    /// Only the vault owner can call this. Increases the `target_value` of unfulfilled
+    /// milestones, making them harder to reach. Already-fulfilled milestones are
+    /// unaffected. This allows the owner to respond to changing circumstances without
+    /// cancelling the vesting schedule.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    /// * `caller` - The address of the caller (must be vault owner)
+    /// * `adjustments` - Vector of `(milestone_index, new_target_value)` pairs
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::VestingNotFound` - If no milestone vesting schedule exists
+    /// * `ContractError::InvalidAmount` - If any milestone is already fulfilled
+    pub fn adjust_milestone_targets(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        adjustments: Vec<(u32, i128)>,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VestingNotFound)?;
+
+        for (idx, new_target) in adjustments.iter() {
+            if idx >= schedule.milestones.len() {
+                return Err(ContractError::InvalidAmount);
+            }
+            let milestone = schedule.milestones.get(idx).unwrap();
+            if milestone.is_fulfilled {
+                return Err(ContractError::InvalidAmount);
+            }
+            schedule.milestones.set(idx, MilestoneEntry {
+                label: milestone.label,
+                target_value: new_target,
+                current_value: milestone.current_value,
+                bps: milestone.bps,
+                is_fulfilled: milestone.is_fulfilled,
+                claimed: milestone.claimed,
+            });
+        }
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MILESTONE_ADJUST_TOPIC, vault_id), ());
+        Ok(())
+    }
+
+    /// Emergency-fulfills one or more milestones, bypassing the oracle.
+    ///
+    /// Only the vault owner can call this. Marks the specified milestones as fulfilled,
+    /// making their funds available for claiming immediately. This is intended for
+    /// emergency situations where the oracle cannot or should not be relied upon.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    /// * `caller` - The address of the caller (must be vault owner)
+    /// * `milestone_indices` - Indices of milestones to mark as fulfilled
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::VestingNotFound` - If no milestone vesting schedule exists
+    /// * `ContractError::InvalidAmount` - If any milestone is already fulfilled or invalid
+    pub fn emergency_fulfill_milestones(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        milestone_indices: Vec<u32>,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VestingNotFound)?;
+
+        let mut any_updated = false;
+        for idx in milestone_indices.iter() {
+            if idx >= schedule.milestones.len() {
+                return Err(ContractError::InvalidAmount);
+            }
+            let milestone = schedule.milestones.get(idx).unwrap();
+            if milestone.is_fulfilled {
+                return Err(ContractError::InvalidAmount);
+            }
+            schedule.milestones.set(idx, MilestoneEntry {
+                label: milestone.label,
+                target_value: milestone.target_value,
+                current_value: milestone.current_value.max(milestone.target_value),
+                bps: milestone.bps,
+                is_fulfilled: true,
+                claimed: milestone.claimed,
+            });
+            any_updated = true;
+        }
+
+        if !any_updated {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MILESTONE_EMERGENCY_TOPIC, vault_id), true);
+        Ok(())
+    }
+
+    /// Reports progress on one or more milestones.
+    ///
+    /// Only the designated oracle address can call this function. When a milestone's
+    /// `current_value` reaches or exceeds its `target_value`, it is marked as fulfilled
+    /// and its funds become available for claiming.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    /// * `milestone_indices` - Indices of milestones to update
+    /// * `current_values` - New current values for each milestone (must match indices length)
+    ///
+    /// # Errors
+    /// * `ContractError::MilestoneVestingNotFound` - If no milestone vesting schedule exists
+    /// * `ContractError::NotMilestoneOracle` - If caller is not the designated oracle
+    /// * `ContractError::InvalidAmount` - If indices and values length mismatch
+    /// * `ContractError::MilestoneAlreadyFulfilled` - If a milestone is already fulfilled
+    pub fn report_milestone_progress(
+        env: Env,
+        vault_id: u64,
+        milestone_indices: Vec<u32>,
+        current_values: Vec<i128>,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        if milestone_indices.len() != current_values.len() {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestoneVestingSchedule(vault_id))
+            .ok_or(ContractError::VestingNotFound)?;
+
+        if schedule.paused {
+            return Err(ContractError::Paused);
+        }
+
+        schedule.oracle.require_auth();
+
+        let mut any_updated = false;
+        for (idx, value) in milestone_indices.iter().zip(current_values.iter()) {
+            if idx >= schedule.milestones.len() {
+                return Err(ContractError::InvalidAmount);
+            }
+            let milestone = &schedule.milestones.get(idx).unwrap();
+            if milestone.is_fulfilled {
+                return Err(ContractError::InvalidAmount);
+            }
+            let was_fulfilled = milestone.current_value >= milestone.target_value;
+            let new_value = value.max(0);
+            let mut updated = milestone.clone();
+            updated.current_value = new_value;
+            if new_value >= updated.target_value && !was_fulfilled {
+                updated.is_fulfilled = true;
+            } else if new_value < updated.target_value {
+                updated.is_fulfilled = false;
+            }
+            schedule.milestones.set(idx, updated);
+            any_updated = true;
+        }
+
+        if !any_updated {
+            return Ok(());
+        }
+
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let ttl = vault_ttl_ledgers(
+            Self::load_vault(&env, vault_id).check_in_interval,
+        );
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        // Emit progress event for each updated milestone
+        for idx in milestone_indices.iter() {
+            let m = &schedule.milestones.get(idx).unwrap();
+            env.events().publish(
+                (MILESTONE_PROGRESS_TOPIC, vault_id),
+                (idx, m.current_value, m.target_value, m.is_fulfilled),
+            );
+        }
+        Ok(())
+    }
+
+    /// Claims all vested installments from fulfilled milestones.
+    ///
+    /// The vault must have been released (`trigger_release`) and a milestone vesting
+    /// schedule must be attached. Funds from all milestones that are fulfilled but
+    /// not yet claimed are distributed to the vault's beneficiaries using the same
+    /// BPS split logic as `trigger_release`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault to claim from
+    ///
+    /// # Returns
+    /// The total amount transferred in this call
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::AlreadyReleased` - If vault is not in Released status
+    /// * `ContractError::MilestoneVestingNotFound` - If no milestone vesting schedule exists
+    /// * `ContractError::NoClaimableMilestones` - If no milestones are ready to claim
+    /// * `ContractError::InsufficientBalance` - If vault balance is insufficient
+    pub fn claim_milestone_installments(env: Env, vault_id: u64) -> Result<i128, ContractError> {
+        Self::assert_not_paused(&env);
+        let mut vault = Self::load_vault(&env, vault_id);
+
+        if vault.status != ReleaseStatus::Released {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestoneVestingSchedule(vault_id))
+            .ok_or(ContractError::VestingNotFound)?;
+
+        if schedule.paused {
+            return Err(ContractError::Paused);
+        }
+
+        // Calculate claimable amounts from fulfilled milestones
+        let mut total_claimable = 0i128;
+        let mut any_claimable = false;
+        let num_milestones = schedule.milestones.len();
+
+        let num_milestones_usize = num_milestones as usize;
+        for (i, milestone) in schedule.milestones.iter().enumerate() {
+            if milestone.is_fulfilled && !milestone.claimed {
+                let is_last = i == num_milestones_usize - 1;
+                let share = if is_last {
+                    schedule.total_amount - total_claimable - schedule.claimed_amount
+                } else {
+                    schedule.total_amount * (milestone.bps as i128) / 10_000
+                };
+                total_claimable += share;
+                any_claimable = true;
+            }
+        }
+
+        if !any_claimable {
+            return Err(ContractError::NothingToClaimYet);
+        }
+
+        if vault.balance < total_claimable {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        // Distribute to beneficiaries
+        let token_client = token::Client::new(&env, &vault.token_address);
+
+        if vault.beneficiaries.is_empty() {
+            token_client.transfer(&env.current_contract_address(), &vault.beneficiary, &total_claimable);
+            env.events().publish(
+                (MILESTONE_CLAIM_TOPIC, vault_id),
+                (vault.beneficiary.clone(), total_claimable, schedule.claimed_amount + total_claimable),
+            );
+        } else {
+            let mut distributed: i128 = 0;
+            let last_idx = vault.beneficiaries.len() - 1;
+            for (i, entry) in vault.beneficiaries.iter().enumerate() {
+                let share = if i as u32 == last_idx {
+                    total_claimable - distributed
+                } else {
+                    total_claimable * (entry.bps as i128) / 10_000
+                };
+                if share > 0 {
+                    token_client.transfer(&env.current_contract_address(), &entry.address, &share);
+                }
+                distributed += share;
+                env.events().publish(
+                    (MILESTONE_CLAIM_TOPIC, vault_id),
+                    (entry.address.clone(), share, schedule.claimed_amount + total_claimable),
+                );
+            }
+        }
+
+        // Update state
+        vault.balance -= total_claimable;
+        let new_claimed = schedule.claimed_amount + total_claimable;
+
+        // Mark milestones as claimed
+        let mut updated_milestones = Vec::new(&env);
+        for milestone in schedule.milestones.iter() {
+            if milestone.is_fulfilled && !milestone.claimed {
+                let mut m = milestone.clone();
+                m.claimed = true;
+                updated_milestones.push_back(m);
+            } else {
+                updated_milestones.push_back(milestone);
+            }
+        }
+        schedule.milestones = updated_milestones;
+        schedule.claimed_amount = new_claimed;
+
+        Self::save_vault(&env, vault_id, &vault);
+
+        let sched_key = DataKey::MilestoneVestingSchedule(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&sched_key, &schedule);
+        env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(total_claimable)
     }
 
     // --- views ---
@@ -5941,7 +6464,7 @@ impl TtlVaultContract {
         }
         // Prevent double-approval
         if proposal.approvals.iter().any(|a| a == caller) {
-            return Err(ContractError::AlreadyApproved);
+            return Err(ContractError::InvalidAmount);
         }
 
         proposal.approvals.push_back(caller.clone());
@@ -6021,7 +6544,7 @@ impl TtlVaultContract {
             .ok_or(ContractError::ProposalNotFound)?;
 
         if proposal.status != ProposalStatus::Approved {
-            return Err(ContractError::ProposalNotApproved);
+            return Err(ContractError::InvalidThreshold);
         }
         let now = env.ledger().timestamp();
         if now > proposal.expires_at {
@@ -6998,7 +7521,7 @@ impl TtlVaultContract {
         // Prevent double-voting
         for v in votes.iter() {
             if v.voter == caller {
-                return Err(ContractError::AlreadyVoted);
+                return Err(ContractError::VotingNotEnabled);
             }
         }
 

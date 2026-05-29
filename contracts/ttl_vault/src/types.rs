@@ -192,6 +192,7 @@ pub enum DataKey {
     MaxCheckInInterval,
     Version,
     VestingSchedule(u64),
+    MilestoneVestingSchedule(u64),
     TokenWhitelist(Address),
     VaultMetadata(u64),
     ParentVault(u64),
@@ -274,6 +275,45 @@ pub struct VestingSchedule {
     /// Cliff duration in seconds from `start_time`. No funds are claimable until
     /// `start_time + cliff_period` has elapsed. Set to 0 to disable.
     pub cliff_period: u64,
+}
+
+/// A single milestone entry in a milestone-based vesting schedule.
+/// Each milestone represents a condition (e.g., company revenue target) that,
+/// when fulfilled, unlocks a portion of the vault's funds.
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneEntry {
+    /// Human-readable label for the milestone (e.g., "Revenue reaches $1M")
+    pub label: String,
+    /// The target value that must be reached to fulfill this milestone
+    pub target_value: i128,
+    /// The current reported progress toward the target
+    pub current_value: i128,
+    /// Basis points of total_amount allocated to this milestone (must sum to 10_000 across all milestones)
+    pub bps: u32,
+    /// Whether this milestone has been marked as fulfilled (current_value >= target_value)
+    pub is_fulfilled: bool,
+    /// Whether funds for this milestone have been claimed
+    pub claimed: bool,
+}
+
+/// Milestone-based vesting schedule attached to a vault.
+/// Instead of releasing funds on a time-based schedule, funds are released
+/// when external milestones (e.g., company revenue targets) are met,
+/// as reported by a designated oracle address.
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneVestingSchedule {
+    /// Total amount to vest across all milestones
+    pub total_amount: i128,
+    /// The list of milestones with their targets and current progress
+    pub milestones: Vec<MilestoneEntry>,
+    /// Total amount already claimed from fulfilled milestones
+    pub claimed_amount: i128,
+    /// Address authorized to report milestone progress
+    pub oracle: Address,
+    /// Whether vesting is paused (progress reporting and claiming blocked)
+    pub paused: bool,
 }
 
 #[contracttype]
