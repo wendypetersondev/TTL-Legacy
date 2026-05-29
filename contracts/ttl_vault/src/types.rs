@@ -85,11 +85,10 @@ pub const PROOF_OF_LIFE_TOPIC: Symbol = symbol_short!("pol_sub");
 pub const RELEASE_VOTE_TOPIC: Symbol = symbol_short!("rel_vote");
 pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
 
-// Previously missing — used by lib.rs internal helpers
-pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
-pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
-pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
-pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("bat_stat");
+// Milestone-based vesting events
+pub const MILESTONE_VEST_TOPIC: Symbol = symbol_short!("m_vest");
+pub const MILESTONE_PROGRESS_TOPIC: Symbol = symbol_short!("m_prog");
+pub const MILESTONE_CLAIM_TOPIC: Symbol = symbol_short!("m_clm");
 
 // Issue: TTL Borrowing
 pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
@@ -141,6 +140,7 @@ pub enum DataKey {
     MaxCheckInInterval,
     Version,
     VestingSchedule(u64),
+    MilestoneVestingSchedule(u64),
     TokenWhitelist(Address),
     VaultMetadata(u64),
     ParentVault(u64),
@@ -180,6 +180,13 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // TTL Borrowing - Issue #484
+    TtlBorrow(u64),
+    // Geographic check-in log - Issue #485
+    CheckInGeoLog(u64),
+    // Check-in rate limiting
+    MinCheckInCooldown,
+    LastCheckInTime(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -215,6 +222,43 @@ pub struct VestingSchedule {
     /// Total amount to vest (in stroops). Each installment = total_amount / num_installments,
     /// with the last installment absorbing any remainder.
     pub total_amount: i128,
+}
+
+/// A single milestone entry in a milestone-based vesting schedule.
+/// Each milestone represents a condition (e.g., company revenue target) that,
+/// when fulfilled, unlocks a portion of the vault's funds.
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneEntry {
+    /// Human-readable label for the milestone (e.g., "Revenue reaches $1M")
+    pub label: String,
+    /// The target value that must be reached to fulfill this milestone
+    pub target_value: i128,
+    /// The current reported progress toward the target
+    pub current_value: i128,
+    /// Basis points of total_amount allocated to this milestone (must sum to 10_000 across all milestones)
+    pub bps: u32,
+    /// Whether this milestone has been marked as fulfilled (current_value >= target_value)
+    pub is_fulfilled: bool,
+    /// Whether funds for this milestone have been claimed
+    pub claimed: bool,
+}
+
+/// Milestone-based vesting schedule attached to a vault.
+/// Instead of releasing funds on a time-based schedule, funds are released
+/// when external milestones (e.g., company revenue targets) are met,
+/// as reported by a designated oracle address.
+#[contracttype]
+#[derive(Clone)]
+pub struct MilestoneVestingSchedule {
+    /// Total amount to vest across all milestones
+    pub total_amount: i128,
+    /// The list of milestones with their targets and current progress
+    pub milestones: Vec<MilestoneEntry>,
+    /// Total amount already claimed from fulfilled milestones
+    pub claimed_amount: i128,
+    /// Address authorized to report milestone progress
+    pub oracle: Address,
 }
 
 #[contracttype]
@@ -536,4 +580,43 @@ pub struct TtlPool {
 pub struct BiometricEntry {
     pub credential_hash: BytesN<32>,
     pub added_at: u64,
+}
+
+/// TTL borrow record for tracking borrowed TTL between vaults - Issue #484
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlBorrowRecord {
+    pub lender_vault_id: u64,
+    pub borrower_vault_id: u64,
+    pub borrowed_seconds: u64,
+    pub borrowed_at: u64,
+    pub repaid: bool,
+}
+
+/// Geographic check-in entry - Issue #485
+#[contracttype]
+#[derive(Clone)]
+pub struct GeoCheckInEntry {
+    pub latitude_micro: i64,
+    pub longitude_micro: i64,
+    pub country_code: String,
+    pub timestamp: u64,
+}
+
+/// Beneficiary proof-of-life entry - Issue #498
+#[contracttype]
+#[derive(Clone)]
+pub struct ProofOfLifeEntry {
+    pub beneficiary: Address,
+    pub submitted_at: u64,
+    pub valid_until: u64,
+}
+
+/// Beneficiary release vote entry - Issue #499
+#[contracttype]
+#[derive(Clone)]
+pub struct ReleaseVoteEntry {
+    pub voter: Address,
+    pub approve: bool,
+    pub voted_at: u64,
 }
