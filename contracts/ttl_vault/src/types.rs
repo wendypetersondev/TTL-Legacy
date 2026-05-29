@@ -1,5 +1,8 @@
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, String, Symbol, Vec};
 
+/// Maximum number of vesting schedules per vault.
+pub const MAX_VESTING_SCHEDULES: u32 = 20;
+
 pub const RELEASE_TOPIC: Symbol = symbol_short!("release");
 pub const VAULT_CREATED_TOPIC: Symbol = symbol_short!("v_created");
 pub const PING_EXPIRY_TOPIC: Symbol = symbol_short!("ping_exp");
@@ -103,6 +106,19 @@ pub const VESTING_PENALTY_TOPIC: Symbol = symbol_short!("vest_pen");
 // Issue #548: vesting claim reversed / finalized
 pub const VESTING_REVERSED_TOPIC: Symbol = symbol_short!("vest_rev");
 pub const VESTING_FINALIZED_TOPIC: Symbol = symbol_short!("vest_fin");
+// Milestone vesting topic symbols
+pub const MILESTONE_VEST_TOPIC: Symbol = symbol_short!("ms_vest");
+pub const MILESTONE_PAUSE_TOPIC: Symbol = symbol_short!("ms_paus");
+pub const MILESTONE_RESUME_TOPIC: Symbol = symbol_short!("ms_resm");
+pub const MILESTONE_ADJUST_TOPIC: Symbol = symbol_short!("ms_adj");
+pub const MILESTONE_EMERGENCY_TOPIC: Symbol = symbol_short!("ms_emer");
+pub const MILESTONE_PROGRESS_TOPIC: Symbol = symbol_short!("ms_prog");
+pub const MILESTONE_CLAIM_TOPIC: Symbol = symbol_short!("ms_clam");
+// Multi-vesting-schedule topic
+pub const VESTING_SCHEDULE_ADDED_TOPIC: Symbol = symbol_short!("vs_add");
+pub const VESTING_SCHEDULE_REMOVED_TOPIC: Symbol = symbol_short!("vs_rem");
+// Clawback of unvested funds
+pub const CLAWBACK_UNVESTED_TOPIC: Symbol = symbol_short!("clawback");
 // Issue #549: passkey expired during check-in
 pub const PASSKEY_EXPIRED_TOPIC: Symbol = symbol_short!("pk_expd");
 // Issue #550: passkey compromise detected or reported
@@ -200,8 +216,12 @@ pub enum DataKey {
     MinCheckInInterval,
     MaxCheckInInterval,
     Version,
-    VestingSchedule(u64),
+    VestingSchedule(u64, u32),
+    VestingPenalty(u64, u32),
+    VestingPendingClaim(u64, u32),
+    VestingScheduleCount(u64),
     MilestoneVestingSchedule(u64),
+    CountdownFired(u64),
     TokenWhitelist(Address),
     VaultMetadata(u64),
     ParentVault(u64),
@@ -293,6 +313,34 @@ pub struct VestingSchedule {
     /// Cliff duration in seconds from `start_time`. No funds are claimable until
     /// `start_time + cliff_period` has elapsed. Set to 0 to disable.
     pub cliff_period: u64,
+}
+
+/// Penalty configuration for late-claim vesting installments.
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingPenaltyConfig {
+    /// Penalty in basis points (e.g., 500 = 5%).
+    pub penalty_bps: u32,
+    /// Seconds after an installment unlocks before the penalty applies.
+    pub grace_period_seconds: u64,
+}
+
+/// A pending vesting claim awaiting finalization (Issue #548).
+#[contracttype]
+#[derive(Clone)]
+pub struct VestingPendingClaim {
+    /// Amount escrowed for the beneficiary.
+    pub amount: i128,
+    /// Address that will receive the funds once finalized.
+    pub beneficiary: Address,
+    /// Timestamp when the pending claim was initiated.
+    pub initiated_at: u64,
+    /// Timestamp after which the reversal window closes.
+    pub reversal_deadline: u64,
+    /// Updated claimed_installments value (used for rollback on reversal).
+    pub new_installments_claimed: u32,
+    /// Previous claimed_installments value before initiation.
+    pub prev_installments_claimed: u32,
 }
 
 /// A single milestone entry in a milestone-based vesting schedule.
@@ -792,6 +840,8 @@ pub struct ReleaseVoteEntry {
 pub struct BeneficiaryRotationEntry {
     pub effective_timestamp: u64,
     pub new_beneficiaries: Vec<BeneficiaryEntry>,
+}
+
 /// Configurable countdown notification thresholds for a vault.
 /// Each threshold (in seconds before expiry) triggers a `cd_notif` event
 /// when `check_countdown` is called and the TTL crosses that boundary.
@@ -802,3 +852,41 @@ pub struct CountdownConfig {
     /// Sorted descending list of thresholds in seconds (e.g. [604800, 259200, 86400]).
     pub thresholds: Vec<u64>,
 }
+
+/// Encrypted backup codes for vault recovery (Issue #553).
+#[contracttype]
+#[derive(Clone)]
+pub struct EncryptedBackupCodes {
+    pub codes: Vec<Bytes>,
+}
+
+/// Passkey usage analytics.
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyAnalytics {
+    pub total_uses: u32,
+    pub unique_passkeys: u32,
+}
+
+/// Per-passkey usage statistics.
+#[contracttype]
+#[derive(Clone)]
+pub struct PasskeyUsageStat {
+    pub passkey_hash: BytesN<32>,
+    pub use_count: u32,
+    pub first_used: u64,
+    pub last_used: u64,
+}
+
+/// Beneficiary commitment for inheritance vaults.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryCommitment {
+    pub commitment_hash: BytesN<32>,
+    pub created_at: u64,
+}
+
+/// Event topic for encrypted backup code operations.
+pub const BACKUP_CODES_ENCRYPTED_TOPIC: Symbol = symbol_short!("bk_enc");
+/// Event topic for passkey analytics.
+pub const PASSKEY_ANALYTICS_TOPIC: Symbol = symbol_short!("pk_anal");

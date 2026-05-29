@@ -9,19 +9,19 @@ mod types;
 pub mod ranking;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
+    VestingPenaltyConfig, VestingPendingClaim,
     MilestoneEntry, MilestoneVestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
     ArchivedVaultInfo, OwnershipTransferRequest, PendingBeneficiaryUpdate, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
-    TtlBorrowRecord,
+    TtlBorrowRecord, BeneficiaryCommitment,
     GeoCheckInEntry,
     ProofOfLifeEntry, ReleaseVoteEntry,
     BeneficiaryRotationEntry,
-    EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC, BENEFICIARY_TIER_SET_TOPIC,
+    EXPIRY_WARNING_THRESHOLD,
+    BENEFICIARY_UPDATED_TOPIC, BENEFICIARY_TRIGGER_SET_TOPIC, BENEFICIARY_TIER_SET_TOPIC,
     BENEFICIARY_WATERFALL_TOPIC, BENEFICIARY_REBALANCED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
-    BeneficiaryCommitment,
-    EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
     SET_VESTING_TOPIC, UNPAUSE_TOPIC, UPDATE_INTERVAL_TOPIC, UPDATE_METADATA_TOPIC,
@@ -45,13 +45,17 @@ use types::{
     BATCH_CHECKIN_TOPIC,
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
-    HibernationEntry,
+    HibernationEntry, EncryptedBackupCodes, PasskeyAnalytics, PasskeyUsageStat,
     HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC,
     INACTIVITY_PENALTY_TOPIC, BEN_ROTATION_TOPIC, CLIFF_REACHED_TOPIC,
     TTL_BORROW_TOPIC, TTL_REPAY_TOPIC,
     CHECKIN_RATE_LIMITED_TOPIC, TTL_ACCELERATE_TOPIC, CHECKIN_GEO_TOPIC,
-    EncryptedBackupCodes, PasskeyAnalytics, PasskeyUsageStat,
     BACKUP_CODES_ENCRYPTED_TOPIC, PASSKEY_ANALYTICS_TOPIC,
+    MILESTONE_VEST_TOPIC, MILESTONE_PAUSE_TOPIC, MILESTONE_RESUME_TOPIC,
+    MILESTONE_ADJUST_TOPIC, MILESTONE_EMERGENCY_TOPIC, MILESTONE_PROGRESS_TOPIC, MILESTONE_CLAIM_TOPIC,
+    VESTING_SCHEDULE_ADDED_TOPIC, VESTING_SCHEDULE_REMOVED_TOPIC,
+    CLAWBACK_UNVESTED_TOPIC,
+    MAX_VESTING_SCHEDULES,
 };
 #[cfg(test)]
 mod regression_tests;
@@ -170,6 +174,9 @@ pub enum ContractError {
     InsufficientTtlToAccelerate = 61,
     TtlBorrowNotFound = 62,
     TtlBorrowAlreadyRepaid = 63,
+    VestingReversalNotFound = 64,
+    VestingReversalExpired = 65,
+    NothingToClawback = 66,
 }
 
 #[contract]
@@ -2022,12 +2029,18 @@ impl TtlVaultContract {
 
     /// Attaches a vesting schedule to a vault.
     ///
-    /// Once set, the vault's balance is released to the beneficiary (or beneficiaries)
-    /// in `num_installments` equal tranches. Each tranche becomes claimable every
-    /// `interval` seconds starting from `start_time`.
+    /// Once set, a portion of the vault's balance (`amount`) is released to the
+    /// beneficiary (or beneficiaries) in `num_installments` equal tranches.
+    /// Each tranche becomes claimable every `interval` seconds starting from
+    /// `start_time`.
     ///
-    /// The vault must have been released (trigger_release called) before installments
-    /// can be claimed. The schedule is set by the owner while the vault is still Locked.
+    /// Multiple independent schedules may be attached to the same vault, each
+    /// with its own amount, timing, and cliff. The sum of all schedule amounts
+    /// must not exceed the vault's current balance.
+    ///
+    /// The vault must be released (`trigger_release`) before installments can
+    /// be claimed. The schedule is set by the owner while the vault is still
+    /// `Locked`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -2036,7 +2049,11 @@ impl TtlVaultContract {
     /// * `start_time` - Unix timestamp of the first claimable installment
     /// * `interval` - Seconds between installments (must be > 0)
     /// * `num_installments` - Number of tranches (must be > 0)
+    /// * `amount` - Amount in stroops allocated to this schedule (must be > 0)
     /// * `cliff_period` - Seconds after `start_time` before any installment can be claimed (0 = no cliff)
+    ///
+    /// # Returns
+    /// The index of the newly created schedule (0-based).
     ///
     /// # Errors
     /// * `ContractError::Paused` - If the contract is paused
@@ -2044,6 +2061,9 @@ impl TtlVaultContract {
     /// * `ContractError::AlreadyReleased` - If vault is not Locked
     /// * `ContractError::InvalidInterval` - If interval or num_installments is 0
     /// * `ContractError::EmptyVault` - If vault balance is 0
+    /// * `ContractError::InvalidAmount` - If amount is <= 0
+    /// * `ContractError::InsufficientBalance` - If total scheduled amount would exceed vault balance
+    /// * `ContractError::VaultCapacityExceeded` - If max schedules per vault reached
     pub fn set_vesting_schedule(
         env: Env,
         vault_id: u64,
@@ -2051,8 +2071,9 @@ impl TtlVaultContract {
         start_time: u64,
         interval: u64,
         num_installments: u32,
+        amount: i128,
         cliff_period: u64,
-    ) -> Result<(), ContractError> {
+    ) -> Result<u32, ContractError> {
         Self::assert_not_paused(&env);
         caller.require_auth();
         let vault = Self::load_vault(&env, vault_id);
@@ -2068,24 +2089,59 @@ impl TtlVaultContract {
         if vault.balance == 0 {
             return Err(ContractError::EmptyVault);
         }
+        if amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // Compute the sum of all existing schedule amounts
+        let count_key = DataKey::VestingScheduleCount(vault_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let mut total_scheduled = amount;
+        for i in 0..count {
+            if let Some(s) = env.storage().persistent()
+                .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(vault_id, i))
+            {
+                total_scheduled = total_scheduled
+                    .checked_add(s.total_amount)
+                    .unwrap_or_else(|| panic_with_error!(&env, ContractError::BalanceOverflow));
+            }
+        }
+        if total_scheduled > vault.balance {
+            return Err(ContractError::InsufficientBalance);
+        }
+        if count >= MAX_VESTING_SCHEDULES {
+            return Err(ContractError::VaultCapacityExceeded);
+        }
+
+        let schedule_index = count;
         let schedule = VestingSchedule {
             start_time,
             interval,
             num_installments,
             claimed_installments: 0,
-            total_amount: vault.balance,
+            total_amount: amount,
             cliff_period,
         };
-        let key = DataKey::VestingSchedule(vault_id);
+        let key = DataKey::VestingSchedule(vault_id, schedule_index);
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
         env.storage().persistent().set(&key, &schedule);
         env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        // Update schedule count
+        let count_key = DataKey::VestingScheduleCount(vault_id);
+        env.storage().persistent().set(&count_key, &(count + 1));
+        env.storage().persistent().extend_ttl(&count_key, VAULT_TTL_THRESHOLD, ttl);
+
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish(
             (SET_VESTING_TOPIC, vault_id),
-            (start_time, interval, num_installments, vault.balance, cliff_period),
+            (start_time, interval, num_installments, amount, cliff_period, schedule_index),
         );
-        Ok(())
+        env.events().publish(
+            (VESTING_SCHEDULE_ADDED_TOPIC, vault_id),
+            (schedule_index, amount),
+        );
+        Ok(schedule_index)
     }
 
     /// Returns the vesting schedule for a vault, if one exists.
@@ -2500,6 +2556,96 @@ impl TtlVaultContract {
         env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(amount)
+    }
+
+    /// Allows the vault owner to claw back unvested funds from a released vault.
+    ///
+    /// After a vault has been released (`trigger_release` called) with one or more
+    /// vesting schedules attached, the owner may reclaim funds that have not yet
+    /// vested — i.e., installments that have not been claimed by the beneficiary.
+    /// All vesting schedules on the vault are marked as fully claimed so no
+    /// further beneficiary claims are possible.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault to claw back from
+    /// * `caller` - Must be the vault owner
+    ///
+    /// # Returns
+    /// The total amount clawed back (in stroops)
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::AlreadyReleased` - If vault is not in Released status
+    /// * `ContractError::VestingNotFound` - If no vesting schedule exists on the vault
+    /// * `ContractError::NothingToClawback` - If all installments have already been claimed
+    /// * `ContractError::InsufficientBalance` - If vault balance is less than unvested amount
+    pub fn clawback_unvested(env: Env, vault_id: u64, caller: Address) -> Result<i128, ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Released {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        // Collect all vesting schedules on this vault
+        let count_key = DataKey::VestingScheduleCount(vault_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count == 0 {
+            return Err(ContractError::VestingNotFound);
+        }
+
+        // Calculate total unvested = sum of unclaimed installment amounts
+        let mut total_unvested: i128 = 0;
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+
+        for i in 0..count {
+            let sched_key = DataKey::VestingSchedule(vault_id, i);
+            if let Some(schedule) = env.storage().persistent().get::<DataKey, VestingSchedule>(&sched_key) {
+                let remaining = schedule.num_installments - schedule.claimed_installments;
+                if remaining > 0 {
+                    let per_installment = schedule.total_amount / schedule.num_installments as i128;
+                    total_unvested += per_installment * remaining as i128;
+                }
+            }
+        }
+
+        if total_unvested == 0 {
+            return Err(ContractError::NothingToClawback);
+        }
+
+        if vault.balance < total_unvested {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        // Transfer unvested funds to owner
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &vault.owner, &total_unvested);
+
+        // Update vault balance
+        vault.balance -= total_unvested;
+
+        // Second pass: mark all schedules as fully claimed
+        for i in 0..count {
+            let sched_key = DataKey::VestingSchedule(vault_id, i);
+            if let Some(mut schedule) = env.storage().persistent().get::<DataKey, VestingSchedule>(&sched_key) {
+                schedule.claimed_installments = schedule.num_installments;
+                env.storage().persistent().set(&sched_key, &schedule);
+                env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
+            }
+        }
+
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (CLAWBACK_UNVESTED_TOPIC, vault_id),
+            (total_unvested, vault.balance),
+        );
+        Ok(total_unvested)
     }
 
     // --- milestone-based vesting ---

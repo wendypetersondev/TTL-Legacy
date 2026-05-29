@@ -5427,3 +5427,161 @@ fn test_get_countdown_config_returns_defaults_when_not_set() {
     assert_eq!(cfg.thresholds.get(1).unwrap(), 259_200u64);
     assert_eq!(cfg.thresholds.get(2).unwrap(), 86_400u64);
 }
+
+// --- clawback_unvested ---
+
+#[test]
+fn test_clawback_unvested_full_amount_when_nothing_claimed() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // 4 installments of 250 each, interval = 100s
+    let vault_id = setup_vesting(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64);
+
+    // Clawback before any claims — full 1000 should be returned
+    let clawed_back = client.clawback_unvested(&vault_id, &owner);
+    assert_eq!(clawed_back, 1_000i128);
+    // Owner gets back the deposit plus initial mint
+    assert_eq!(token_client.balance(&owner), 1_000_000i128);
+    assert_eq!(client.get_vault(&vault_id).balance, 0i128);
+}
+
+#[test]
+fn test_clawback_unvested_requires_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = setup_vesting(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64);
+
+    let stranger = Address::generate(&env);
+    let err = client
+        .try_clawback_unvested(&vault_id, &stranger)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::NotOwner);
+}
+
+#[test]
+fn test_clawback_unvested_requires_released_status() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1_000i128);
+    let start = env.ledger().timestamp() + 200;
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
+    // Vault is still Locked, not Released
+
+    let err = client
+        .try_clawback_unvested(&vault_id, &owner)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::AlreadyReleased);
+}
+
+#[test]
+fn test_clawback_unvested_nothing_to_clawback_after_full_clawback() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = setup_vesting(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64);
+
+    // First clawback succeeds
+    let clawed = client.clawback_unvested(&vault_id, &owner);
+    assert_eq!(clawed, 1_000i128);
+
+    // Second clawback has nothing left
+    let err = client
+        .try_clawback_unvested(&vault_id, &owner)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::NothingToClawback);
+}
+
+#[test]
+fn test_clawback_unvested_no_vesting_schedule() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1_000i128);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+    // Vault is Released but has no vesting schedule
+
+    let err = client
+        .try_clawback_unvested(&vault_id, &owner)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::VestingNotFound);
+}
+
+#[test]
+fn test_clawback_unvested_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = setup_vesting(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64);
+
+    client.clawback_unvested(&vault_id, &owner);
+
+    assert!(find_event_by_topic(&env, types::CLAWBACK_UNVESTED_TOPIC));
+}
+
+#[test]
+fn test_clawback_unvested_with_partial_claim_before_clawback() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // 4 installments of 250 each, interval = 100s, start_time = now+200
+    // setup_vesting sets start_time = now+200 and then advances time by 200 to trigger release
+    // So after setup_vesting, now = start_time
+    let vault_id = setup_vesting(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64);
+
+    // Advance 1 interval: 1 installment claimable (unlocked = 1)
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    // Claim that installment
+    client.claim_vested_installment(&vault_id);
+    assert_eq!(token_client.balance(&beneficiary), 250i128);
+
+    // Clawback the remaining 750 (3 unclaimed installments)
+    let clawed_back = client.clawback_unvested(&vault_id, &owner);
+    assert_eq!(clawed_back, 750i128);
+
+    // Vault balance should now reflect the clawback
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.balance, 0i128);
+}
+
+#[test]
+fn test_clawback_unvested_multiple_schedules() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &2_000i128);
+
+    // Set first vesting schedule: 600 total, 3 installments of 200 each
+    let start1 = env.ledger().timestamp() + 200;
+    client.set_vesting_schedule(&vault_id, &owner, &start1, &100u64, &3u32, &0u64);
+
+    // Set second vesting schedule: 400 total, 2 installments of 200 each
+    client.set_vesting_schedule(&vault_id, &owner, &start1, &100u64, &2u32, &0u64);
+
+    // Expire and release
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    // Claim first installment from the first schedule (200)
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.claim_vested_installment(&vault_id);
+
+    // Clawback: remaining unvested = (2 * 200) + (2 * 200) = 800
+    let clawed_back = client.clawback_unvested(&vault_id, &owner);
+    assert_eq!(clawed_back, 800i128);
+    let vault = client.get_vault(&vault_id);
+    assert_eq!(vault.balance, 1_000i128); // 2000 - 200 (claimed) - 800 (clawback) = 1000
+}
+
+#[test]
+fn test_clawback_unvested_respects_paused_state() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = setup_vesting(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64);
+
+    client.pause();
+
+    let err = client
+        .try_clawback_unvested(&vault_id, &owner)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::Paused);
+}
