@@ -2973,6 +2973,28 @@ fn test_security_token_whitelist_enforcement() {
 }
 
 #[test]
+fn test_cross_chain_wrapped_token_support() {
+    let (env, owner, beneficiary, _, xlm_token, client) = setup();
+
+    let wrapped_token_admin = Address::generate(&env);
+    let wrapped_token = env
+        .register_stellar_asset_contract_v2(wrapped_token_admin)
+        .address();
+
+    StellarAssetClient::new(&env, &wrapped_token).mint(&owner, &1_000_000);
+    client.register_wrapped_token(&wrapped_token, &xlm_token);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &Some(wrapped_token.clone()));
+    assert!(vault_id > 0);
+
+    client.deposit(&vault_id, &owner, &100_000i128);
+    assert_eq!(client.get_vault(&vault_id).balance, 100_000i128);
+
+    let resolved = client.get_wrapped_token(&wrapped_token).unwrap();
+    assert_eq!(resolved, xlm_token);
+}
+
+#[test]
 fn test_security_vesting_prevents_double_claim() {
     let (env, owner, beneficiary, _, token_address, client) = setup();
     

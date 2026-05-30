@@ -14,6 +14,7 @@ use types::{
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
     ArchivedVaultInfo, OwnershipTransferRequest, PendingBeneficiaryUpdate, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
+    TokenConversion, TokenStaking,
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
     TtlBorrowRecord, BeneficiaryCommitment,
     GeoCheckInEntry,
@@ -59,6 +60,7 @@ use types::{
     BACKUP_CODES_ENCRYPTED_TOPIC, PASSKEY_ANALYTICS_TOPIC,
     WITHDRAWAL_VALIDATION_TOPIC, WITHDRAWAL_LIMIT_SET_TOPIC, WITHDRAWAL_LIMIT_EXCEEDED_TOPIC,
     WHITELIST_ADDED_TOPIC, WHITELIST_REMOVED_TOPIC, WHITELIST_VIOLATION_TOPIC,
+    WRAPPED_TOKEN_REGISTERED_TOPIC, WRAPPED_TOKEN_UNREGISTERED_TOPIC,
     WITHDRAWAL_REVERSED_TOPIC, REVERSAL_GRACE_EXPIRED_TOPIC,
     VestingCatchUpConfig, VestingBonusConfig,
     VESTING_CATCHUP_SET_TOPIC, VESTING_CATCHUP_CLAIMED_TOPIC,
@@ -197,6 +199,7 @@ pub enum ContractError {
     CatchUpNotEnabled = 72,
     // Issue #546: vesting bonus
     BonusNotEnabled = 73,
+    TokenNotWhitelisted = 74,
 }
 
 #[contract]
@@ -438,22 +441,79 @@ impl TtlVaultContract {
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
     }
 
+    /// Gets the canonical token address for a registered wrapped token.
+    pub fn get_wrapped_token(env: Env, wrapped_token_address: Address) -> Option<Address> {
+        let key = DataKey::WrappedToken(wrapped_token_address);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Resolves a token to its canonical equivalent if it is a wrapped token.
+    pub fn resolve_canonical_token(env: Env, token_address: Address) -> Address {
+        Self::get_wrapped_token(env.clone(), token_address.clone()).unwrap_or(token_address)
+    }
+
     /// Checks if a token is whitelisted.
     ///
     /// # Arguments
     /// * `token_address` - The token contract address to check
     ///
     /// # Returns
-    /// `true` if the token is whitelisted or is the default XLM token, `false` otherwise
+    /// `true` if the token is whitelisted, is the default XLM token, or is a registered wrapped token whose canonical token is whitelisted.
     pub fn is_token_whitelisted(env: Env, token_address: Address) -> bool {
-        // Default XLM token is always whitelisted
         let default_token = Self::load_token(&env);
         if token_address == default_token {
             return true;
         }
-        
-        let key = DataKey::TokenWhitelist(token_address);
-        env.storage().persistent().get(&key).unwrap_or(false)
+
+        let key = DataKey::TokenWhitelist(token_address.clone());
+        if env.storage().persistent().get::<DataKey, bool>(&key).unwrap_or(false) {
+            return true;
+        }
+
+        if let Some(canonical_token) = Self::get_wrapped_token(env.clone(), token_address.clone()) {
+            if canonical_token == default_token {
+                return true;
+            }
+
+            let canonical_key = DataKey::TokenWhitelist(canonical_token);
+            env.storage().persistent().get::<DataKey, bool>(&canonical_key).unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    /// Registers a wrapped token for cross-chain compatibility.
+    ///
+    /// Wrapped tokens are accepted as whitelisted if their canonical token is whitelisted.
+    pub fn register_wrapped_token(
+        env: Env,
+        wrapped_token_address: Address,
+        canonical_token_address: Address,
+    ) {
+        Self::require_admin(&env);
+        if wrapped_token_address == canonical_token_address {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+
+        Self::assert_token_whitelisted(&env, &canonical_token_address);
+
+        let key = DataKey::WrappedToken(wrapped_token_address.clone());
+        env.storage().persistent().set(&key, &canonical_token_address);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (WRAPPED_TOKEN_REGISTERED_TOPIC,),
+            (&wrapped_token_address, &canonical_token_address),
+        );
+    }
+
+    /// Unregisters a wrapped token mapping.
+    pub fn unregister_wrapped_token(env: Env, wrapped_token_address: Address) {
+        Self::require_admin(&env);
+        let key = DataKey::WrappedToken(wrapped_token_address.clone());
+        env.storage().persistent().remove(&key);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((WRAPPED_TOKEN_UNREGISTERED_TOPIC,), wrapped_token_address);
     }
 
     // --- Cross-Chain Bridge Support (Issue #366) ---
@@ -6150,15 +6210,9 @@ impl TtlVaultContract {
     }
 
     fn assert_token_whitelisted(env: &Env, token_address: &Address) {
-        let default_token = Self::load_token(env);
-        if token_address == &default_token {
-            return;
-        }
-        
-        let key = DataKey::TokenWhitelist(token_address.clone());
-        let is_whitelisted: bool = env.storage().persistent().get(&key).unwrap_or(false);
-        if !is_whitelisted {
-            panic_with_error!(env, ContractError::NotOwner); // Reusing error code for simplicity
+        let token_address = token_address.clone();
+        if !Self::is_token_whitelisted(env.clone(), token_address) {
+            panic_with_error!(env, ContractError::TokenNotWhitelisted);
         }
     }
 

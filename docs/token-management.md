@@ -77,6 +77,33 @@ if let Some(conversion) = client.get_token_conversion(&vault_id) {
 }
 ```
 
+## Wrapped Token Support for Cross-Chain Compatibility
+
+### Purpose
+
+Allow vault owners to use wrapped tokens that represent a canonical token from another chain or bridge.
+Wrapped tokens are accepted whenever their registered canonical token is whitelisted.
+
+### API
+
+#### Register Wrapped Token
+
+```rust
+pub fn register_wrapped_token(
+    env: Env,
+    wrapped_token_address: Address,
+    canonical_token_address: Address,
+)
+```
+
+### Example Usage
+
+```rust
+client.register_wrapped_token(&wrapped_token, &xlm_token);
+```
+
+Wrapped token registration makes it possible to create vaults and deposit with the wrapped asset while still enforcing the canonical token whitelist.
+
 ## Issue #582: Token Whitelisting Validation
 
 ### Purpose
