@@ -206,6 +206,9 @@ pub const TOKEN_HEDGE_CLOSE_TOPIC: Symbol = symbol_short!("tok_hcls");
 pub const TOKEN_REBALANCE_TOPIC: Symbol = symbol_short!("tok_rebl");
 pub const TOKEN_REBALANCED_TOPIC: Symbol = symbol_short!("tok_rebd");
 
+// Issue #528: beneficiary allocation swap
+pub const BEN_SWAPPED_TOPIC: Symbol = symbol_short!("ben_swap");
+
 // Vault state snapshots
 pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
 pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");

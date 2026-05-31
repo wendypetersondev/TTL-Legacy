@@ -73,9 +73,12 @@ use types::{
     TokenCollateral, TOKEN_COLLATERAL_TOPIC, TOKEN_COLLAT_RLSD_TOPIC,
     TokenHedge, TOKEN_HEDGE_TOPIC, TOKEN_HEDGE_CLOSE_TOPIC,
     TokenWeight, TokenRebalanceConfig, TOKEN_REBALANCE_TOPIC, TOKEN_REBALANCED_TOPIC,
+    BEN_SWAPPED_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod beneficiary_swap_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -10520,5 +10523,63 @@ impl TtlVaultContract {
     /// Returns the token rebalancing configuration for a vault.
     pub fn get_token_rebalance(env: Env, vault_id: u64) -> Option<TokenRebalanceConfig> {
         env.storage().persistent().get(&DataKey::TokenRebalance(vault_id))
+    }
+
+    /// Atomically swaps the BPS allocations of two vault beneficiaries - Issue #528.
+    ///
+    /// Both `a` and `b` must appear in the vault's beneficiary list. The swap is a
+    /// two-assignment mutation inside a single transaction, so it is atomic by EVM/SVM
+    /// transaction semantics and has no reentrancy surface.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault whose beneficiary list is mutated
+    /// * `caller`   - Must be the vault owner
+    /// * `a`        - First beneficiary address
+    /// * `b`        - Second beneficiary address
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`           - caller is not the vault owner
+    /// * `ContractError::InvalidBeneficiary` - `a` or `b` is not in the beneficiary list
+    pub fn swap_allocations(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        a: Address,
+        b: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let mut idx_a: Option<u32> = None;
+        let mut idx_b: Option<u32> = None;
+        for (i, entry) in vault.beneficiaries.iter().enumerate() {
+            if entry.address == a {
+                idx_a = Some(i as u32);
+            }
+            if entry.address == b {
+                idx_b = Some(i as u32);
+            }
+        }
+        let ia = idx_a.ok_or(ContractError::InvalidBeneficiary)?;
+        let ib = idx_b.ok_or(ContractError::InvalidBeneficiary)?;
+
+        let bps_a = vault.beneficiaries.get(ia).unwrap().bps;
+        let bps_b = vault.beneficiaries.get(ib).unwrap().bps;
+
+        let mut entry_a = vault.beneficiaries.get(ia).unwrap();
+        let mut entry_b = vault.beneficiaries.get(ib).unwrap();
+        entry_a.bps = bps_b;
+        entry_b.bps = bps_a;
+        vault.beneficiaries.set(ia, entry_a);
+        vault.beneficiaries.set(ib, entry_b);
+
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((BEN_SWAPPED_TOPIC, vault_id), (a, b, bps_a, bps_b));
+        Ok(())
     }
 }
