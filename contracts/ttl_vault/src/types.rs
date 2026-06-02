@@ -416,6 +416,13 @@ pub enum DataKey {
     // Issue #529: beneficiary pooling
     BeneficiaryPool(u64),
     BeneficiaryPoolAlloc(u64),
+    // Issue #525: beneficiary vesting schedules
+    BeneficiaryVestingSchedule(u64, Address),
+    BeneficiaryVestingCount(u64),
+    // Issue #527: beneficiary auctions
+    BeneficiaryAuction(u64),
+    BeneficiaryAuctionBid(u64, Address),
+    BeneficiaryAuctionCount,
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -1307,3 +1314,68 @@ pub struct BeneficiaryPool {
     pub members: Vec<Address>,
     pub total_bps: u32,
 }
+
+/// Beneficiary-specific vesting schedule - Issue #525.
+/// Different beneficiaries can have different vesting timelines.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryVestingSchedule {
+    pub beneficiary: Address,
+    pub vault_id: u64,
+    /// Unix timestamp when this beneficiary's vesting starts.
+    pub start_time: u64,
+    /// Seconds between installments.
+    pub interval: u64,
+    /// Total number of installments.
+    pub num_installments: u32,
+    /// Claimed installments for this beneficiary.
+    pub claimed_installments: u32,
+    /// Total amount allocated to this beneficiary.
+    pub total_amount: i128,
+    /// Cliff duration in seconds from start_time.
+    pub cliff_period: u64,
+}
+
+/// Beneficiary auction bid - Issue #527.
+/// Allow beneficiaries to bid for larger allocations.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryAuctionBid {
+    pub auction_id: u64,
+    pub bidder: Address,
+    pub bid_amount: i128,
+    /// Desired allocation in basis points (e.g., 5000 = 50%).
+    pub desired_allocation_bps: u32,
+    pub bid_timestamp: u64,
+    /// True if bid was accepted.
+    pub accepted: bool,
+}
+
+/// Beneficiary auction configuration - Issue #527.
+/// Auction for determining final beneficiary allocations.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryAuction {
+    pub auction_id: u64,
+    pub vault_id: u64,
+    /// Start of bidding period (Unix timestamp).
+    pub start_time: u64,
+    /// End of bidding period (Unix timestamp).
+    pub end_time: u64,
+    /// Total allocation being auctioned in basis points.
+    pub total_allocation_bps: u32,
+    /// Minimum bid amount in stroops.
+    pub minimum_bid: i128,
+    pub bids: Vec<BeneficiaryAuctionBid>,
+    /// True if auction has concluded.
+    pub finalized: bool,
+    /// Winner address (if finalized).
+    pub winner: Option<Address>,
+}
+
+/// Event topics for vesting and auction - Issue #525, #527
+pub const SET_BENEFICIARY_VESTING_TOPIC: Symbol = symbol_short!("set_bvst");
+pub const CLAIM_BENEFICIARY_VESTING_TOPIC: Symbol = symbol_short!("clm_bvst");
+pub const AUCTION_CREATED_TOPIC: Symbol = symbol_short!("auc_crt");
+pub const AUCTION_BID_TOPIC: Symbol = symbol_short!("auc_bid");
+pub const AUCTION_FINALIZED_TOPIC: Symbol = symbol_short!("auc_fin");

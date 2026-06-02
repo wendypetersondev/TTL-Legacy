@@ -81,6 +81,8 @@ use types::{
 mod regression_tests;
 #[cfg(test)]
 mod beneficiary_pooling_tests;
+#[cfg(test)]
+mod beneficiary_vesting_auction_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -217,6 +219,11 @@ pub enum ContractError {
     NotReleased = 75,
     GracePeriodExpired = 76,
     NothingToClawback = 77,
+    // Issue #527: beneficiary auction
+    AuctionNotFound = 78,
+    AuctionAlreadyExists = 79,
+    AuctionEnded = 80,
+    AuctionNotEnded = 81,
 }
 
 #[contract]
@@ -4747,6 +4754,272 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::BeneficiaryTierThreshold(vault_id, beneficiary))
             .unwrap_or(0)
+    }
+
+    /// Set a beneficiary-specific vesting schedule - Issue #525
+    /// Different beneficiaries can have different vesting timelines.
+    pub fn set_beneficiary_vesting(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        beneficiary: Address,
+        start_time: u64,
+        interval: u64,
+        num_installments: u32,
+        cliff_period: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if interval == 0 || num_installments == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+        let schedule = BeneficiaryVestingSchedule {
+            beneficiary: beneficiary.clone(),
+            vault_id,
+            start_time,
+            interval,
+            num_installments,
+            claimed_installments: 0,
+            total_amount: vault.balance,
+            cliff_period,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryVestingSchedule(vault_id, beneficiary.clone()), &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BeneficiaryVestingSchedule(vault_id, beneficiary.clone()), VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.events().publish((SET_BENEFICIARY_VESTING_TOPIC, vault_id), (beneficiary, start_time, interval, num_installments));
+        Ok(())
+    }
+
+    /// Get beneficiary-specific vesting schedule - Issue #525
+    pub fn get_beneficiary_vesting(
+        env: Env,
+        vault_id: u64,
+        beneficiary: Address,
+    ) -> Option<BeneficiaryVestingSchedule> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BeneficiaryVestingSchedule(vault_id, beneficiary))
+    }
+
+    /// Claim available vesting installments for a specific beneficiary - Issue #525
+    pub fn claim_beneficiary_vesting(
+        env: Env,
+        vault_id: u64,
+        beneficiary: Address,
+    ) -> Result<i128, ContractError> {
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.status != ReleaseStatus::Released {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let mut schedule = env
+            .storage()
+            .persistent()
+            .get::<_, BeneficiaryVestingSchedule>(&DataKey::BeneficiaryVestingSchedule(vault_id, beneficiary.clone()))
+            .ok_or(ContractError::VestingNotFound)?;
+
+        let now = env.ledger().timestamp() as u64;
+        if now < schedule.start_time + schedule.cliff_period {
+            return Err(ContractError::CliffNotReached);
+        }
+
+        let elapsed = now.saturating_sub(schedule.start_time);
+        let available_installments = ((elapsed / schedule.interval) + 1).min(schedule.num_installments as u64) as u32;
+
+        if available_installments <= schedule.claimed_installments {
+            return Err(ContractError::NothingToClaimYet);
+        }
+
+        let per_installment = schedule.total_amount / (schedule.num_installments as i128);
+        let new_claims = available_installments - schedule.claimed_installments;
+        let mut amount = per_installment * (new_claims as i128);
+
+        if available_installments == schedule.num_installments {
+            amount = vault.balance;
+        }
+
+        if amount <= 0 || amount > vault.balance {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        vault.balance -= amount;
+        schedule.claimed_installments = available_installments;
+
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryVestingSchedule(vault_id, beneficiary.clone()), &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BeneficiaryVestingSchedule(vault_id, beneficiary.clone()), VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+
+        env.events().publish((CLAIM_BENEFICIARY_VESTING_TOPIC, vault_id), (beneficiary, amount));
+        Ok(amount)
+    }
+
+    /// Create a beneficiary auction - Issue #527
+    /// Allow beneficiaries to bid for larger allocations.
+    pub fn create_beneficiary_auction(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        start_time: u64,
+        end_time: u64,
+        total_allocation_bps: u32,
+        minimum_bid: i128,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if env.storage().persistent().has(&DataKey::BeneficiaryAuction(vault_id)) {
+            return Err(ContractError::AuctionAlreadyExists);
+        }
+
+        let auction_id = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::BeneficiaryAuctionCount)
+            .unwrap_or(0)
+            + 1;
+
+        let auction = BeneficiaryAuction {
+            auction_id,
+            vault_id,
+            start_time,
+            end_time,
+            total_allocation_bps,
+            minimum_bid,
+            bids: vec![&env],
+            finalized: false,
+            winner: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryAuction(vault_id), &auction);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryAuctionCount, &auction_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BeneficiaryAuction(vault_id), VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+
+        env.events().publish((AUCTION_CREATED_TOPIC, vault_id), (auction_id, start_time, end_time));
+        Ok(())
+    }
+
+    /// Place a bid in a beneficiary auction - Issue #527
+    pub fn place_auction_bid(
+        env: Env,
+        vault_id: u64,
+        bidder: Address,
+        bid_amount: i128,
+        desired_allocation_bps: u32,
+    ) -> Result<(), ContractError> {
+        bidder.require_auth();
+
+        let mut auction = env
+            .storage()
+            .persistent()
+            .get::<_, BeneficiaryAuction>(&DataKey::BeneficiaryAuction(vault_id))
+            .ok_or(ContractError::AuctionNotFound)?;
+
+        let now = env.ledger().timestamp() as u64;
+        if now < auction.start_time || now >= auction.end_time {
+            return Err(ContractError::AuctionEnded);
+        }
+
+        if bid_amount < auction.minimum_bid {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let bid = BeneficiaryAuctionBid {
+            auction_id: auction.auction_id,
+            bidder: bidder.clone(),
+            bid_amount,
+            desired_allocation_bps,
+            bid_timestamp: now,
+            accepted: false,
+        };
+
+        auction.bids.push_back(bid);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryAuction(vault_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BeneficiaryAuction(vault_id), VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+
+        env.events().publish((AUCTION_BID_TOPIC, vault_id), (bidder, bid_amount));
+        Ok(())
+    }
+
+    /// Get beneficiary auction - Issue #527
+    pub fn get_beneficiary_auction(env: Env, vault_id: u64) -> Option<BeneficiaryAuction> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BeneficiaryAuction(vault_id))
+    }
+
+    /// Get auction bids - Issue #527
+    pub fn get_beneficiary_auction_bids(env: Env, vault_id: u64) -> Vec<BeneficiaryAuctionBid> {
+        env.storage()
+            .persistent()
+            .get::<_, BeneficiaryAuction>(&DataKey::BeneficiaryAuction(vault_id))
+            .map(|a| a.bids)
+            .unwrap_or_else(|| vec![&env])
+    }
+
+    /// Finalize a beneficiary auction - Issue #527
+    pub fn finalize_beneficiary_auction(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let mut auction = env
+            .storage()
+            .persistent()
+            .get::<_, BeneficiaryAuction>(&DataKey::BeneficiaryAuction(vault_id))
+            .ok_or(ContractError::AuctionNotFound)?;
+
+        let now = env.ledger().timestamp() as u64;
+        if now < auction.end_time {
+            return Err(ContractError::AuctionNotEnded);
+        }
+
+        if auction.bids.is_empty() {
+            auction.finalized = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey::BeneficiaryAuction(vault_id), &auction);
+            return Ok(());
+        }
+
+        // Find highest bidder
+        let winner_idx = auction
+            .bids
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, bid)| bid.bid_amount)
+            .map(|(idx, _)| idx)
+            .ok_or(ContractError::AuctionNotFound)?;
+
+        let winner = auction.bids.get(winner_idx).unwrap().bidder.clone();
+        auction.winner = Some(winner.clone());
+        auction.finalized = true;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryAuction(vault_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::BeneficiaryAuction(vault_id), VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+
+        env.events().publish((AUCTION_FINALIZED_TOPIC, vault_id), winner);
+        Ok(())
     }
 
     /// Extends passkey expiry - Issue #396
