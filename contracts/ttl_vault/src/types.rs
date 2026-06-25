@@ -71,6 +71,8 @@ pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");
 pub const MULTISIG_APPROVED_TOPIC: Symbol = symbol_short!("ms_app");
 pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
 pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
+pub const MULTISIG_VETOED_TOPIC: Symbol = symbol_short!("ms_veto");
+pub const MULTISIG_SIGNER_REMOVED_TOPIC: Symbol = symbol_short!("ms_rm_sig");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
 
 pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
@@ -993,6 +995,7 @@ pub enum ProposalStatus {
     Rejected,
     Executed,
     Expired,
+    Vetoed,
 }
 
 /// State transition record for vault status changes - Issue #472

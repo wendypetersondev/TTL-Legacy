@@ -38,7 +38,7 @@ use types::{
     SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
     RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_CLONED_OVERRIDE_TOPIC, VAULT_MERGED_TOPIC,
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
-    MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
+    MULTISIG_EXECUTED_TOPIC, MULTISIG_VETOED_TOPIC, MULTISIG_SIGNER_REMOVED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
     WITHDRAWAL_APPROVAL_REQUESTED_TOPIC, WITHDRAWAL_APPROVAL_GRANTED_TOPIC, WITHDRAWAL_APPROVAL_DENIED_TOPIC,
     PASSKEY_RECOVERY_INITIATED_TOPIC, PASSKEY_RECOVERED_TOPIC,
     PASSKEY_LOCKOUT_TOPIC, PASSKEY_UNLOCKED_TOPIC,
@@ -5247,7 +5247,7 @@ impl TtlVaultContract {
             return Err(ContractError::Paused);
         }
         caller.require_auth();
-        let mut vault = Self::load_vault(&env, vault_id);
+        let vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
@@ -5257,24 +5257,29 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
+        // If multi-sig is configured, require proposal instead
+        if env.storage().persistent().has(&DataKey::MultiSigConfig(vault_id)) {
+            return Err(ContractError::MultiSigRequired);
+        }
         let refund_amount = vault.balance;
         if refund_amount > 0 {
             let token_client = token::Client::new(&env, &vault.token_address);
             token_client.transfer(&env.current_contract_address(), &vault.owner, &refund_amount);
         }
-        vault.balance = 0;
-        vault.status = ReleaseStatus::Cancelled;
-        Self::save_vault(&env, vault_id, &vault);
-        Self::remove_owner_vault_id(&env, &vault.owner, vault_id, vault.check_in_interval);
-        Self::remove_beneficiary_vault_id(&env, &vault.beneficiary, vault_id, vault.check_in_interval);
+        let mut v = vault.clone();
+        v.balance = 0;
+        v.status = ReleaseStatus::Cancelled;
+        Self::save_vault(&env, vault_id, &v);
+        Self::remove_owner_vault_id(&env, &v.owner, vault_id, v.check_in_interval);
+        Self::remove_beneficiary_vault_id(&env, &v.beneficiary, vault_id, v.check_in_interval);
         // Remove duplicate key so the same parameters can be reused
-        let dup_key = DataKey::VaultDuplicate(vault.owner.clone(), vault.beneficiary.clone(), vault.check_in_interval);
+        let dup_key = DataKey::VaultDuplicate(v.owner.clone(), v.beneficiary.clone(), v.check_in_interval);
         env.storage().persistent().remove(&dup_key);
         Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Cancelled, &caller);
         Self::log_audit_entry(&env, vault_id, "cancel_vault", &caller, "");
         Self::append_activity_log(&env, vault_id, "cancel_vault", &caller, "");
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((CANCEL_TOPIC, vault_id), (vault.owner, refund_amount));
+        env.events().publish((CANCEL_TOPIC, vault_id), (v.owner, refund_amount));
         Ok(())
     }
 
@@ -8208,6 +8213,82 @@ impl TtlVaultContract {
         Ok(())
     }
 
+    /// Remove a single signer from multi-sig config (owner-only).
+    /// Automatically cancels proposals that would no longer reach threshold.
+    pub fn remove_multisig_signer(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        signer_to_remove: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let mut config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
+            .ok_or(ContractError::MultiSigRequired)?;
+
+        // Remove the signer
+        let mut new_signers = Vec::new(&env);
+        let mut found = false;
+        for s in config.signers.iter() {
+            if s == signer_to_remove {
+                found = true;
+            } else {
+                new_signers.push_back(s.clone());
+            }
+        }
+        if !found {
+            return Err(ContractError::NotASigner);
+        }
+
+        config.signers = new_signers;
+
+        // If threshold now exceeds total signers (owner + remaining signers), lower threshold
+        let total = config.signers.len() as u32 + 1;
+        if config.threshold > total {
+            config.threshold = total;
+        }
+
+        let key = DataKey::MultiSigConfig(vault_id);
+        env.storage().persistent().set(&key, &config);
+        env.storage().persistent().extend_ttl(
+            &key, VAULT_TTL_THRESHOLD, vault_ttl_ledgers(vault.check_in_interval),
+        );
+
+        // Cancel proposals that won't reach the new threshold
+        let proposal_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultiSigProposalCount(vault_id))
+            .unwrap_or(0);
+
+        for proposal_id in 1..=proposal_count {
+            let prop_key = DataKey::MultiSigProposal(vault_id, proposal_id);
+            if let Some(mut proposal) = env.storage().persistent().get::<DataKey, MultiSigProposal>(&prop_key) {
+                if proposal.status == ProposalStatus::Pending {
+                    let approvals_without_removed = proposal.approvals.iter()
+                        .filter(|a| a != &signer_to_remove)
+                        .count() as u32;
+
+                    if approvals_without_removed < config.threshold {
+                        proposal.status = ProposalStatus::Rejected;
+                        env.storage().persistent().set(&prop_key, &proposal);
+                    }
+                }
+            }
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MULTISIG_SIGNER_REMOVED_TOPIC, vault_id), signer_to_remove);
+        Ok(())
+    }
+
     /// Returns the multi-sig config for a vault, if set.
     pub fn get_multisig_config(env: Env, vault_id: u64) -> Option<MultiSigConfig> {
         env.storage()
@@ -8389,6 +8470,49 @@ impl TtlVaultContract {
         env.storage().persistent().set(&prop_key, &proposal);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish((MULTISIG_REJECTED_TOPIC, vault_id), proposal_id);
+        Ok(())
+    }
+
+    /// Veto a proposal (any registered signer or owner).
+    /// A vetoed proposal is immediately cancelled and cannot be executed.
+    pub fn veto_proposal(
+        env: Env,
+        vault_id: u64,
+        proposal_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+
+        let config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig(vault_id))
+            .ok_or(ContractError::MultiSigRequired)?;
+
+        let vault = Self::load_vault(&env, vault_id);
+
+        // Caller must be owner or a configured co-signer
+        let is_owner = caller == vault.owner;
+        let is_signer = config.signers.iter().any(|s| s == caller);
+        if !is_owner && !is_signer {
+            return Err(ContractError::NotASigner);
+        }
+
+        let prop_key = DataKey::MultiSigProposal(vault_id, proposal_id);
+        let mut proposal = env
+            .storage()
+            .persistent()
+            .get::<DataKey, MultiSigProposal>(&prop_key)
+            .ok_or(ContractError::ProposalNotFound)?;
+
+        if proposal.status == ProposalStatus::Executed || proposal.status == ProposalStatus::Expired {
+            return Err(ContractError::ProposalNotFound);
+        }
+
+        proposal.status = ProposalStatus::Vetoed;
+        env.storage().persistent().set(&prop_key, &proposal);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MULTISIG_VETOED_TOPIC, vault_id), (proposal_id, caller));
         Ok(())
     }
 
