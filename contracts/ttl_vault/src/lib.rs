@@ -5447,9 +5447,6 @@ impl TtlVaultContract {
     ) -> Result<(), ContractError> {
         caller.require_auth();
         let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
 
         let key = DataKey::PendingOwnership(vault_id);
         if !env.storage().persistent().has(&key) {
@@ -5460,12 +5457,21 @@ impl TtlVaultContract {
             .persistent()
             .get::<DataKey, OwnershipTransferRequest>(&key)
             .unwrap();
+
+        let reason = if caller == vault.owner {
+            String::from_str(&env, "cancelled")
+        } else if caller == request.new_owner {
+            String::from_str(&env, "declined")
+        } else {
+            return Err(ContractError::NotOwner);
+        };
+
         let cancelled_new_owner = request.new_owner.clone();
         env.storage().persistent().remove(&key);
 
         Self::log_audit_entry(&env, vault_id, "cancel_ownership_transfer", &caller, "");
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((OWNERSHIP_CANCELLED_TOPIC, vault_id), (caller, cancelled_new_owner));
+        env.events().publish((OWNERSHIP_CANCELLED_TOPIC, vault_id), (caller, cancelled_new_owner, reason));
         Ok(())
     }
 

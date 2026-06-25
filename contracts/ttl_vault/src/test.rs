@@ -578,6 +578,32 @@ fn test_cancel_ownership_transfer_emits_cancelled_event() {
 }
 
 #[test]
+fn test_new_owner_can_decline_ownership_transfer() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    client.cancel_ownership_transfer(&vault_id, &new_owner);
+
+    assert!(client.get_pending_ownership_transfer(&vault_id).is_none());
+    assert_eq!(client.get_vault(&vault_id).owner, owner);
+    assert!(find_event_by_topic(&env, types::OWNERSHIP_CANCELLED_TOPIC));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_unrelated_address_cannot_cancel_ownership_transfer() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    client.initiate_ownership_transfer(&vault_id, &owner, &new_owner);
+    client.cancel_ownership_transfer(&vault_id, &stranger);
+}
+
+#[test]
 fn test_accept_ownership_transfer_emits_accepted_event() {
     let (env, owner, beneficiary, _, _, client) = setup();
     let new_owner = Address::generate(&env);
