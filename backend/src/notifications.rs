@@ -46,6 +46,8 @@ pub fn create_retry_store() -> RetryStore {
 /// Exponential backoff delays in seconds: 1 min, 5 min, 15 min, 1 hr, 6 hr.
 const RETRY_DELAYS_SECS: [u64; 5] = [60, 300, 900, 3_600, 21_600];
 
+pub const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 5;
+
 // ── FCM HTTP v1 client ───────────────────────────────────────────────────────
 
 /// Thin wrapper around the FCM HTTP v1 send endpoint.
@@ -236,7 +238,9 @@ impl NotificationService {
         if let Some(v) = req.warning_hours_before {
             prefs.warning_hours_before = v;
         }
-
+        if let Some(v) = req.locale {
+            prefs.locale = Some(v);
+        }
     }
 
 
@@ -276,6 +280,7 @@ impl NotificationService {
             notification_type: NotificationType::ExpiryWarning,
             scheduled_at: fire_at,
             status: DeliveryStatus::Pending,
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
         });
     }
 
@@ -314,6 +319,7 @@ impl NotificationService {
             notification_type,
             scheduled_at: Utc::now(),
             status: DeliveryStatus::Pending,
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
         });
     }
 
@@ -401,18 +407,21 @@ impl NotificationService {
             self.update_retry_log(notif, attempt, DeliveryStatus::Sent, "");
         } else {
             let next_attempt = attempt + 1;
-            if (next_attempt as usize) < RETRY_DELAYS_SECS.len() {
-                // Schedule next retry
+            let max_attempts = notif.max_retry_attempts;
+            if next_attempt < max_attempts && (next_attempt as usize) < RETRY_DELAYS_SECS.len() {
                 let delay = RETRY_DELAYS_SECS[next_attempt as usize];
                 let next_at = Utc::now() + chrono::Duration::seconds(delay as i64);
                 self.record(notif, DeliveryStatus::Retrying, &last_err);
                 self.mark_sent(&notif.id, DeliveryStatus::Retrying);
                 self.update_retry_log_with_next(notif, attempt, DeliveryStatus::Retrying, &last_err, Some(next_at));
             } else {
-                // All retries exhausted
                 self.record(notif, DeliveryStatus::Failed, &last_err);
                 self.mark_sent(&notif.id, DeliveryStatus::Failed);
                 self.update_retry_log(notif, attempt, DeliveryStatus::Failed, &last_err);
+                log::warn!(
+                    "Notification retry budget exhausted: notification={} vault={} owner={} attempts={}/{}",
+                    notif.id, notif.vault_id, notif.owner, next_attempt, max_attempts
+                );
                 log::error!(
                     "[ALERT] Reminder delivery permanently failed after {} attempts: vault={} owner={} error={}",
                     next_attempt, notif.vault_id, notif.owner, last_err
@@ -609,6 +618,7 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: true,
                 warning_hours_before: 24,
+                locale: None,
             },
 
         );
@@ -638,8 +648,8 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: true,
                 warning_hours_before: 24,
+                locale: None,
             },
-
         );
 
         svc.schedule_expiry_warning(&vault);
@@ -667,8 +677,8 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: true,
                 warning_hours_before: 24,
+                locale: None,
             },
-
         );
         svc.schedule_immediate("v1", "owner1", NotificationType::VaultReleased);
 
@@ -688,8 +698,8 @@ mod tests {
                 check_in_reminder_enabled: true,
                 vault_released_enabled: false,
                 warning_hours_before: 24,
+                locale: None,
             },
-
         );
         svc.schedule_immediate("v1", "owner1", NotificationType::VaultReleased);
 
@@ -809,5 +819,42 @@ mod tests {
     fn retry_delays_match_spec() {
         // 1 min, 5 min, 15 min, 1 hr, 6 hr
         assert_eq!(RETRY_DELAYS_SECS, [60, 300, 900, 3_600, 21_600]);
+    }
+
+    // Retry budget tests (#829)
+
+    #[test]
+    fn default_max_retry_attempts_is_five() {
+        assert_eq!(DEFAULT_MAX_RETRY_ATTEMPTS, 5);
+    }
+
+    #[test]
+    fn scheduled_notification_has_max_retry_attempts() {
+        let svc = make_service();
+        svc.schedule_immediate("v1", "owner1", NotificationType::CheckInReminder);
+        let all = svc.schedule.lock().unwrap();
+        assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_marks_failed() {
+        let svc = make_service();
+        svc.schedule_immediate("v1", "owner1", NotificationType::CheckInReminder);
+        // No tokens registered — first delivery attempt fails immediately
+        svc.flush_pending().await;
+        let log = svc.get_reminder_delivery_status("v1").unwrap();
+        assert_eq!(log.status, DeliveryStatus::Failed);
+        // No retry scheduled because no-tokens is an immediate failure
+        assert!(log.next_retry_at.is_none());
+    }
+
+    #[test]
+    fn max_retry_attempts_propagated_in_schedule() {
+        let svc = make_service();
+        let vault = make_vault(Some(172_800));
+        svc.schedule_expiry_warning(&vault);
+        let all = svc.schedule.lock().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].max_retry_attempts, DEFAULT_MAX_RETRY_ATTEMPTS);
     }
 }
