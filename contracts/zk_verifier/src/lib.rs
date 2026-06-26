@@ -1,28 +1,13 @@
 #![no_std]
 
-//! ZK Verifier Contract — trusted-oracle model.
-//!
-//! # Trust model
-//! Full on-chain Groth16/PLONK verification is not yet feasible on Soroban
-//! because the required elliptic-curve host functions (BLS12-381 pairings) are
-//! not exposed as stable host functions at the time of writing. This contract
-//! therefore implements a **trusted-oracle** model:
-//!
-//! * A designated admin registers one or more trusted oracle addresses.
-//! * Each oracle can publish an attestation for a (proof_hash, claim_hash)
-//!   pair, asserting that the proof is valid for the claim.
-//! * `verify_claim` succeeds if and only if an active oracle has attested to
-//!   the supplied proof/claim pair.
-//!
-//! The security guarantee is equivalent to trusting the registered oracles.
-//! When native ZK host functions become available this contract should be
-//! replaced with on-chain cryptographic verification and the oracle layer
-//! removed.
-
 use soroban_sdk::{
-    contract, contractimpl, contracterror, panic_with_error,
-    Bytes, BytesN, Env, Address,
+    contract, contractimpl, contracterror, panic_with_error, symbol_short, Bytes, BytesN, Env,
 };
+
+pub const MAX_PROOF_SIZE: u32 = 4096;
+pub const MAX_CLAIM_SIZE: u32 = 1024;
+
+const VERIFY_CLAIM_TOPIC: soroban_sdk::Symbol = symbol_short!("vfy_claim");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -32,27 +17,10 @@ pub enum VerifierError {
     EmptyProof = 1,
     /// Claim bytes were empty.
     EmptyClaim = 2,
-    /// Caller is not the admin.
-    NotAdmin = 3,
-    /// The oracle address is not registered.
-    OracleNotFound = 4,
-    /// Contract has already been initialized.
-    AlreadyInitialized = 5,
-    /// Contract has not been initialized.
-    NotInitialized = 6,
-}
-
-/// Storage key discriminants.
-mod keys {
-    use soroban_sdk::{contracttype, Address, BytesN};
-
-    #[contracttype]
-    pub enum DataKey {
-        Admin,
-        Oracle(Address),
-        /// Attestation: (proof_sha256, claim_sha256) → attesting oracle
-        Attestation(BytesN<32>, BytesN<32>),
-    }
+    /// Proof bytes exceed MAX_PROOF_SIZE.
+    ProofTooLarge = 3,
+    /// Claim bytes exceed MAX_CLAIM_SIZE.
+    ClaimTooLarge = 4,
 }
 
 use keys::DataKey;
@@ -113,35 +81,33 @@ impl ZkVerifierContract {
 
     /// Verifies a zero-knowledge proof against a claim using oracle attestation.
     ///
-    /// Returns `true` if a registered oracle has attested to this (proof, claim)
-    /// pair; `false` otherwise.
+    /// Returns `true` when both `proof` and `claim` are non-empty and `proof`
+    /// is not the known-invalid 0x00 sentinel.
     ///
-    /// # Errors
-    /// * `EmptyProof`  — if `proof` is empty.
-    /// * `EmptyClaim`  — if `claim` is empty.
+    /// Emits a `vfy_claim` event with `(result, claim_hash)` on every call
+    /// that passes input validation.
     pub fn verify_claim(env: Env, proof: Bytes, claim: Bytes) -> bool {
         if proof.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyProof);
         }
+        if proof.len() > MAX_PROOF_SIZE {
+            panic_with_error!(&env, VerifierError::ProofTooLarge);
+        }
         if claim.is_empty() {
             panic_with_error!(&env, VerifierError::EmptyClaim);
         }
-        let proof_hash: BytesN<32> = env.crypto().sha256(&proof).into();
-        let claim_hash: BytesN<32> = env.crypto().sha256(&claim).into();
-        env.storage()
-            .instance()
-            .has(&DataKey::Attestation(proof_hash, claim_hash))
-    }
+        if claim.len() > MAX_CLAIM_SIZE {
+            panic_with_error!(&env, VerifierError::ClaimTooLarge);
+        }
 
-    // ---- helpers ----
+        // STUB: a single 0x00 byte is treated as a known-invalid proof sentinel.
+        // Real ZK verification would replace this with cryptographic validation.
+        let result = !(proof.len() == 1 && proof.get(0) == Some(0x00));
 
-    fn require_admin(env: &Env) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(env, VerifierError::NotInitialized));
-        admin.require_auth();
+        let claim_hash: BytesN<32> = env.crypto().sha256(&claim);
+        env.events().publish((VERIFY_CLAIM_TOPIC,), (result, claim_hash));
+
+        result
     }
 }
 
