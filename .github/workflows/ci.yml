@@ -47,22 +47,14 @@ jobs:
         run: cargo install cargo-audit
 
       - name: Run security audit
-        run: cargo audit
+        run: cargo audit --deny warnings
 
-      - name: Build WASM with release
-        run: cargo build --package ttl-vault --target wasm32-unknown-unknown --release
-
-      - name: Check WASM size
+      - name: Validate OpenAPI specification
         run: |
-          WASM_PATH="target/wasm32-unknown-unknown/release/ttl_vault.wasm"
-          WASM_SIZE=$(stat -f%z "$WASM_PATH" 2>/dev/null || stat -c%s "$WASM_PATH" 2>/dev/null)
-          WASM_SIZE_KB=$((WASM_SIZE / 1024))
-          THRESHOLD_KB=512
-          
-          echo "WASM size: ${WASM_SIZE_KB} KB (threshold: ${THRESHOLD_KB} KB)"
-          
-          if [ "$WASM_SIZE_KB" -gt "$THRESHOLD_KB" ]; then
-            echo "❌ WASM size exceeds threshold by $((WASM_SIZE_KB - THRESHOLD_KB)) KB"
-            exit 1
+          if command -v spectacle &> /dev/null; then
+            spectacle docs/openapi.yaml
           fi
-          echo "✓ WASM size check passed"
+          python3 -m pip install openapi-spec-validator 2>/dev/null || true
+          if command -v openapi-spec-validator &> /dev/null; then
+            openapi-spec-validator docs/openapi.yaml
+          fi

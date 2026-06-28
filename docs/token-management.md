@@ -15,6 +15,288 @@ TTL-Legacy now supports advanced token management capabilities that allow vault 
 7. **Hedge token price risk** using derivatives (Issue #587)
 8. **Rebalance multi-token portfolios** based on target weights (Issue #588)
 
+## Fee Calculation
+
+This section explains how various fees are calculated in TTL-Legacy token management operations, enabling users to predict transaction costs and understand fee distribution.
+
+### Swap Fees
+
+Swap fees are charged when converting one token to another.
+
+**Formula:**
+```
+swap_fee = (amount * swap_fee_bps) / 10000
+amount_after_fee = amount - swap_fee
+```
+
+**Parameters:**
+- `amount`: Total input token amount
+- `swap_fee_bps`: Basis points charged by the protocol (default: 30 bps = 0.3%)
+- `amount_after_fee`: Actual amount used for conversion
+
+**Example:**
+```
+Input amount: 1,000 USDC
+Swap fee rate: 30 bps (0.3%)
+Swap fee = (1,000 * 30) / 10000 = 3 USDC
+Amount converted = 1,000 - 3 = 997 USDC
+```
+
+**Fee Distribution:**
+- 70% goes to protocol treasury (2.1 USDC)
+- 30% goes to the vault as a rebate (0.9 USDC)
+
+### Conversion Fees
+
+Conversion fees apply when transferring between different token types during withdrawal or release.
+
+**Formula:**
+```
+conversion_fee = (amount * conversion_fee_bps) / 10000
+amount_received = amount - conversion_fee
+```
+
+**Parameters:**
+- `amount`: Total token amount to convert
+- `conversion_fee_bps`: Basis points charged (default: 15 bps = 0.15%)
+- `from_token`: Source token
+- `to_token`: Destination token
+
+**Example:**
+```
+Original vault amount: 500 XLM
+Converting to USDC
+Conversion fee rate: 15 bps (0.15%)
+Conversion fee = (500 * 15) / 10000 = 0.75 XLM
+Amount after fee = 500 - 0.75 = 499.25 XLM (converted)
+```
+
+**Fee Distribution:**
+- 60% goes to protocol treasury (0.45 XLM)
+- 40% goes to the originating token pool (0.30 XLM)
+
+### Staking Fees
+
+Staking fees are charged when enabling or managing staked positions.
+
+**Formula:**
+```
+entry_fee = (amount * staking_entry_fee_bps) / 10000
+management_fee = (staked_amount * annual_management_fee_bps / 365) / 10000
+```
+
+**Parameters:**
+- `amount`: Amount being staked
+- `staking_entry_fee_bps`: Entry fee in basis points (default: 25 bps = 0.25%)
+- `annual_management_fee_bps`: Annual management fee (default: 50 bps = 0.5% per year)
+
+**Example:**
+```
+Staking 10,000 XLM
+
+Entry fee = (10,000 * 25) / 10000 = 2.5 XLM
+Amount staked = 10,000 - 2.5 = 9,997.5 XLM
+
+Daily management fee = (9,997.5 * 50 / 365) / 10000 = 0.137 XLM/day
+Annual management fee = 50 XLM (approximately)
+```
+
+**Fee Distribution:**
+- Entry fee: 100% to protocol treasury
+- Management fee: 80% to protocol, 20% to vault operator
+
+### Yield Distribution Fees
+
+When yield is distributed or reinvested, fees may apply based on the distribution method.
+
+**Formula:**
+```
+yield_accrued = (staked_amount * annual_yield_bps * days_elapsed) / (10000 * 365)
+distribution_fee = (yield_accrued * yield_fee_bps) / 10000
+yield_after_fee = yield_accrued - distribution_fee
+```
+
+**Parameters:**
+- `annual_yield_bps`: Annual yield rate (varies by staking pool, e.g., 500 bps = 5% APY)
+- `days_elapsed`: Number of days since staking or last distribution
+- `yield_fee_bps`: Fee on distributed yield (default: 10 bps = 0.1%)
+
+**Example:**
+```
+Staked amount: 10,000 XLM at 5% APY
+Days elapsed: 365 (1 year)
+
+Yield accrued = (10,000 * 500 * 365) / (10000 * 365) = 500 XLM
+Yield fee = (500 * 10) / 10000 = 0.5 XLM
+Yield distributed = 500 - 0.5 = 499.5 XLM
+
+Options:
+1. Distribute to beneficiary: 499.5 XLM sent
+2. Reinvest: 499.5 XLM added to staked amount
+3. Split (70/30): 349.65 XLM to beneficiary, 149.85 XLM reinvested
+```
+
+**Fee Distribution:**
+- 100% of yield fees go to protocol treasury
+
+### Lending Fees
+
+Lending fees include entry fees and origination fees charged by the protocol.
+
+**Formula:**
+```
+entry_fee = (loan_amount * lending_entry_fee_bps) / 10000
+origination_fee = (loan_amount * origination_fee_bps) / 10000
+total_fees = entry_fee + origination_fee
+net_loan_amount = loan_amount - total_fees
+```
+
+**Parameters:**
+- `loan_amount`: Amount being lent out
+- `lending_entry_fee_bps`: Entry fee (default: 50 bps = 0.5%)
+- `origination_fee_bps`: Origination fee (default: 25 bps = 0.25%)
+- `interest_rate_bps`: Annual interest rate (e.g., 500 bps = 5%)
+
+**Example:**
+```
+Lending 5,000 XLM at 5% annual interest for 180 days
+
+Entry fee = (5,000 * 50) / 10000 = 2.5 XLM
+Origination fee = (5,000 * 25) / 10000 = 1.25 XLM
+Total fees = 3.75 XLM
+Net loan to borrower = 5,000 - 3.75 = 4,996.25 XLM
+
+Interest accrued = (5,000 * 500 * 180) / (10000 * 365) = 123.29 XLM
+Total received after loan term = 5,000 + 123.29 = 5,123.29 XLM
+```
+
+**Fee Distribution:**
+- Entry fee: 100% to protocol treasury
+- Origination fee: 100% to protocol treasury
+- Interest: 100% to vault owner
+
+### Collateral Fees
+
+Collateral fees apply when using vault tokens as collateral for external loans.
+
+**Formula:**
+```
+collateral_fee = (collateral_amount * collateral_fee_bps) / 10000
+```
+
+**Parameters:**
+- `collateral_amount`: Amount used as collateral
+- `collateral_fee_bps`: Annual collateral management fee (default: 30 bps = 0.3%)
+
+**Example:**
+```
+Using 2,000 XLM as collateral for a loan
+
+Annual collateral fee = (2,000 * 30) / 10000 = 0.6 XLM per year
+Monthly fee = 0.6 / 12 = 0.05 XLM per month
+```
+
+**Fee Distribution:**
+- 100% to protocol treasury
+
+### Hedging Fees
+
+Hedging fees cover the cost of maintaining derivative positions.
+
+**Formula:**
+```
+hedge_fee = (notional_amount * annual_hedge_fee_bps * days_active) / (10000 * 365)
+```
+
+**Parameters:**
+- `notional_amount`: Notional value of the hedge
+- `annual_hedge_fee_bps`: Annual fee rate (default: 100 bps = 1%)
+- `days_active`: Number of days the hedge has been active
+
+**Example:**
+```
+Hedging 1,000 XLM (notional: $200 at $0.20/XLM) for 90 days
+Annual hedge fee rate: 1% (100 bps)
+
+Hedge fee = (1,000 * 100 * 90) / (10000 * 365) = 2.47 XLM
+```
+
+**Fee Distribution:**
+- 80% to protocol treasury (1.98 XLM)
+- 20% to hedge provider/liquidity pool (0.49 XLM)
+
+### Rebalancing Fees
+
+Rebalancing fees apply when the portfolio is rebalanced to target weights.
+
+**Formula:**
+```
+rebalance_fee = (total_portfolio_value * rebalance_fee_bps) / 10000
+```
+
+**Parameters:**
+- `total_portfolio_value`: Sum of all token values in the vault
+- `rebalance_fee_bps`: Fee per rebalance event (default: 40 bps = 0.4%)
+
+**Example:**
+```
+Portfolio value: 
+- 1,000 XLM ($200)
+- 1,000 USDC ($1,000)
+- Total: $1,200
+
+Rebalancing fee = ($1,200 * 40) / 10000 = $4.80 (or ~24 XLM)
+```
+
+**Fee Distribution:**
+- 100% to protocol treasury
+
+### Fee Summary Table
+
+| Operation | Typical Fee | Distribution | Notes |
+|-----------|------------|--------------|-------|
+| Swap | 30 bps | 70% treasury, 30% vault | Applied on conversion amount |
+| Conversion | 15 bps | 60% treasury, 40% pool | Applied on output amount |
+| Staking Entry | 25 bps | 100% treasury | One-time at staking start |
+| Staking Management | 50 bps/year | 80% treasury, 20% operator | Daily deduction |
+| Yield Distribution | 10 bps | 100% treasury | Applied to yield only |
+| Lending Entry | 50 bps | 100% treasury | One-time upfront |
+| Lending Origination | 25 bps | 100% treasury | One-time upfront |
+| Collateral | 30 bps/year | 100% treasury | Monthly deduction |
+| Hedging | 100 bps/year | 80% treasury, 20% provider | Daily deduction |
+| Rebalancing | 40 bps | 100% treasury | Per rebalance event |
+
+### Gas Fee Considerations
+
+Smart contract operations incur Stellar network fees in addition to TTL-Legacy fees.
+
+**Typical Gas Costs (XLM):**
+- Simple transfer: 0.00001 XLM (1 stroops)
+- Token contract interaction: 0.0001 - 0.001 XLM (10-100 stroops)
+- Complex multi-step operation: 0.001 - 0.01 XLM (100-1000 stroops)
+
+**Total Cost Example:**
+```
+Staking 10,000 XLM:
+1. Staking entry fee: 2.5 XLM
+2. Network gas: ~0.0005 XLM
+3. Total: ~2.5005 XLM
+
+Effective cost: 0.025005% (minimal additional impact)
+```
+
+### Fee Adjustment Strategy
+
+Protocol fees may be adjusted by governance. Upcoming changes include:
+
+- Dynamic fees based on network congestion
+- Tiered fees for high-volume users
+- Loyalty discounts for long-term vault holders
+- Fee reductions during low-activity periods
+
+**Monitoring Fee Changes:**
+Subscribe to TTL-Legacy notifications for protocol updates affecting fees.
+
 ## Issue #581: Token Conversion
 
 ### Purpose
