@@ -48,3 +48,21 @@ jobs:
 
       - name: Run security audit
         run: cargo audit
+
+      - name: Build WASM with release
+        run: cargo build --package ttl-vault --target wasm32-unknown-unknown --release
+
+      - name: Check WASM size
+        run: |
+          WASM_PATH="target/wasm32-unknown-unknown/release/ttl_vault.wasm"
+          WASM_SIZE=$(stat -f%z "$WASM_PATH" 2>/dev/null || stat -c%s "$WASM_PATH" 2>/dev/null)
+          WASM_SIZE_KB=$((WASM_SIZE / 1024))
+          THRESHOLD_KB=512
+          
+          echo "WASM size: ${WASM_SIZE_KB} KB (threshold: ${THRESHOLD_KB} KB)"
+          
+          if [ "$WASM_SIZE_KB" -gt "$THRESHOLD_KB" ]; then
+            echo "❌ WASM size exceeds threshold by $((WASM_SIZE_KB - THRESHOLD_KB)) KB"
+            exit 1
+          fi
+          echo "✓ WASM size check passed"
